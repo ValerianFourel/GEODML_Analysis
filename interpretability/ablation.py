@@ -22,7 +22,6 @@ from tqdm import tqdm
 from interpretability.utils import (
     ABLATION_RULES,
     Checkpoint,
-    InferenceRanker,
     TREATMENT_TO_COL,
     _extract_domain,
     ablate_snippet,
@@ -31,6 +30,7 @@ from interpretability.utils import (
     data_root,
     load_main_table,
     load_serp,
+    make_ranker,
     parse_ranked_domains,
 )
 
@@ -142,11 +142,16 @@ def main() -> int:
     ap.add_argument("--serp-pool", type=int, default=50)
     ap.add_argument("--serp-backend", default="searxng")
     ap.add_argument(
+        "--backend", choices=("api", "local"),
+        default=os.getenv("ABLATION_BACKEND", "api"),
+        help="'api' = HF Inference API (needs internet). 'local' = load model "
+             "on this box with 4-bit quant (for air-gapped clusters like Jülich).",
+    )
+    ap.add_argument(
         "--models",
-        default=os.getenv(
-            "REMOTE_MODELS",
-            "meta-llama/Llama-3.3-70B-Instruct,Qwen/Qwen2.5-72B-Instruct",
-        ),
+        default=None,
+        help="Comma-separated model IDs. Defaults: api -> REMOTE_MODELS env; "
+             "local -> LOCAL_MODEL env.",
     )
     ap.add_argument(
         "--treatments", default=",".join(TREATMENTS_TO_ABLATE),
@@ -177,9 +182,18 @@ def main() -> int:
     serp_by_kw = {k: g.sort_values("position").to_dict("records")
                   for k, g in serp_df.groupby("keyword")}
 
+    if args.models is None:
+        if args.backend == "api":
+            args.models = os.getenv(
+                "REMOTE_MODELS",
+                "meta-llama/Llama-3.3-70B-Instruct,Qwen/Qwen2.5-72B-Instruct",
+            )
+        else:
+            args.models = os.getenv("LOCAL_MODEL", "meta-llama/Llama-3.1-8B-Instruct")
     models = [m.strip() for m in args.models.split(",") if m.strip()]
     treatments = [t.strip() for t in args.treatments.split(",") if t.strip()]
-    rankers = {m: InferenceRanker(model=m) for m in models}
+    print(f"[ablation] backend={args.backend} models={models}")
+    rankers = {m: make_ranker(args.backend, m) for m in models}
 
     # Idempotent resume: if CSV exists, skip (keyword, treatment, model) already done.
     done_keys: set[tuple[str, str, str]] = set()

@@ -19,6 +19,8 @@ mkdir -p interpretability/output/plots
 SAMPLE_ABL="${SAMPLE_ABL:-500}"
 SAMPLE_SAL="${SAMPLE_SAL:-200}"
 SAMPLE_PROBE="${SAMPLE_PROBE:-2000}"
+# Default ablation backend: 'api' for laptops, 'local' for air-gapped HPC (Jülich).
+ABLATION_BACKEND="${ABLATION_BACKEND:-api}"
 
 echo "==> 0/5  Download dataset (skip if already present)"
 python scripts/download_data.py
@@ -26,8 +28,8 @@ python scripts/download_data.py
 echo "==> 1/5  Sanity-check DML table"
 python scripts/sanity_check.py || echo "(mismatch logged; continuing)"
 
-echo "==> 2/5  Option 1 — Ablation (HF Inference API, ~2-4 h)"
-python -m interpretability.ablation --sample-n "$SAMPLE_ABL" --resume
+echo "==> 2/5  Option 1 — Ablation (backend=$ABLATION_BACKEND)"
+python -m interpretability.ablation --sample-n "$SAMPLE_ABL" --resume --backend "$ABLATION_BACKEND"
 
 echo "==> 3/5  Extract HTML caches (needed for Options 2 & 3)"
 python scripts/download_data.py --no-download --extract-html

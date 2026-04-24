@@ -251,11 +251,11 @@ def parse_ranked_domains(llm_output: str) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# HF Inference API client (for ablation.py)
+# Ranker backends (API for online, Local for offline HPC clusters)
 # ---------------------------------------------------------------------------
 
 class InferenceRanker:
-    """Thin wrapper over huggingface_hub.InferenceClient.chat_completion."""
+    """Online: thin wrapper over huggingface_hub.InferenceClient.chat_completion."""
 
     def __init__(self, model: str, token: str | None = None, max_retries: int = 4):
         from huggingface_hub import InferenceClient
@@ -280,6 +280,80 @@ class InferenceRanker:
                 sleep = min(60, 2 ** attempt)
                 time.sleep(sleep)
         raise RuntimeError(f"HF inference failed after {self.max_retries} retries: {last_err}")
+
+
+class LocalRanker:
+    """Offline: load a HF causal-LM locally (4-bit if CUDA is available) and
+    generate the re-ranking output. Use this on air-gapped clusters like Jülich.
+
+    Handles both chat-template-capable models (Llama-3.*-Instruct, Qwen-Instruct)
+    and raw-prompt fallback.
+    """
+
+    def __init__(self, model: str, quantize: bool = True, dtype: str = "bfloat16"):
+        import torch
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
+        self.model_name = model
+        self.tok = AutoTokenizer.from_pretrained(model, use_fast=True)
+        if self.tok.pad_token_id is None:
+            self.tok.pad_token = self.tok.eos_token
+
+        cuda = torch.cuda.is_available()
+        kw: dict = {}
+        if cuda:
+            kw["device_map"] = "auto"
+            if quantize:
+                try:
+                    from transformers import BitsAndBytesConfig
+                    kw["quantization_config"] = BitsAndBytesConfig(
+                        load_in_4bit=True,
+                        bnb_4bit_compute_dtype=torch.bfloat16,
+                        bnb_4bit_quant_type="nf4",
+                        bnb_4bit_use_double_quant=True,
+                    )
+                except Exception as e:
+                    print(f"[LocalRanker] bitsandbytes unavailable ({e}); fp16 instead")
+                    kw["torch_dtype"] = torch.float16
+        else:
+            kw["torch_dtype"] = getattr(torch, dtype, torch.float32)
+        self.model = AutoModelForCausalLM.from_pretrained(model, **kw)
+        self.model.eval()
+        self.device = next(self.model.parameters()).device
+        self._has_chat_template = bool(getattr(self.tok, "chat_template", None))
+
+    def rank(self, prompt: str, max_tokens: int = 500, temperature: float = 0.1) -> str:
+        import torch
+
+        if self._has_chat_template:
+            messages = [{"role": "user", "content": prompt}]
+            input_ids = self.tok.apply_chat_template(
+                messages, add_generation_prompt=True, return_tensors="pt"
+            ).to(self.device)
+        else:
+            input_ids = self.tok(prompt, return_tensors="pt").input_ids.to(self.device)
+
+        with torch.no_grad():
+            out = self.model.generate(
+                input_ids=input_ids,
+                max_new_tokens=max_tokens,
+                do_sample=temperature > 0,
+                temperature=max(temperature, 1e-5),
+                top_p=1.0,
+                pad_token_id=self.tok.eos_token_id,
+            )
+        # Strip the prompt tokens — only return the generated continuation.
+        gen = out[0, input_ids.shape[-1]:]
+        return self.tok.decode(gen, skip_special_tokens=True)
+
+
+def make_ranker(backend: str, model: str) -> "InferenceRanker | LocalRanker":
+    """Factory. backend ∈ {'api', 'local'}."""
+    if backend == "api":
+        return InferenceRanker(model=model)
+    if backend == "local":
+        return LocalRanker(model=model)
+    raise ValueError(f"unknown backend: {backend}")
 
 
 # ---------------------------------------------------------------------------

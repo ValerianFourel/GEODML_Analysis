@@ -39,6 +39,25 @@ python -m interpretability.probing  --sample-n 2000   # local GPU, ~30-60 min
 python -m interpretability.make_figures
 ```
 
+### Air-gapped clusters (e.g. Jülich)
+
+All three analyses run with zero outbound HTTP — the HF bundle already
+contains the full SERP snapshots (`data/serp/phase0_*.parquet`) and every
+page's cached HTML (`data/runs/*/phase2/html_cache.tar.gz`). For ablation,
+switch the re-ranker to a locally-loaded model:
+
+```bash
+# Stage the dataset on a machine with internet, rsync to the cluster, then:
+ABLATION_BACKEND=local ./run_all.sh
+# or:
+python -m interpretability.ablation --sample-n 500 --backend local \
+    --models meta-llama/Llama-3.1-8B-Instruct
+```
+
+`--backend local` reuses the same 4-bit quantization path as saliency and
+probing, so ablation now fits in ~10 GB VRAM. No `HF_TOKEN` needed beyond
+the initial dataset download.
+
 ---
 
 ## Layout
