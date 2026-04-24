@@ -1,0 +1,19 @@
+huggingface_hub>=0.24
+datasets>=2.20
+pandas>=2.2
+pyarrow>=16
+numpy>=1.26
+scikit-learn>=1.4
+matplotlib>=3.8
+seaborn>=0.13
+tqdm>=4.66
+beautifulsoup4>=4.12
+lxml>=5.1
+python-dotenv>=1.0
+
+# GPU-only (install on the local GPU box; ablation.py does not need these).
+# Uncomment or install separately:
+# torch>=2.4
+# transformers>=4.45
+# accelerate>=0.34
+# bitsandbytes>=0.43

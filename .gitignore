@@ -1,0 +1,38 @@
+# secrets
+.env
+.env.local
+*.pem
+hf_token.txt
+
+# data (large — re-download on demand)
+geodml_data/
+data/
+*.parquet
+*.tar.gz
+*.tar
+
+# outputs
+output/
+interpretability/output/
+checkpoints/
+*.ckpt
+
+# caches
+.cache/
+.hf_cache/
+.huggingface/
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+
+# venv
+venv/
+.venv/
+env/
+
+# editor/OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
