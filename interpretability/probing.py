@@ -92,81 +92,136 @@ def _load_model(model_name: str, device: str):
     return model, tok
 
 
-def t7_in_context_hidden_states(
-    model, tok, prompts_with_spans: list[tuple[str, list[dict]]],
-    device: str, max_len: int = 2048,
+def _t7_extract_one_prompt(
+    model, tok, prompt: str, spans: list[dict], device: str, max_len: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[dict]]:
-    """In-context probe data for T7.
-
-    For each (prompt, spans) tuple, run one forward pass on the full re-rank
-    prompt and pool hidden states over the token positions that fall inside
-    each candidate URL's result line. This binds the activations to the text
-    the LLM actually reads about each URL — the bracketed [domain] is the
-    only T7 signal in the prompt.
-
-    Each span dict must already include the URL's binary `label`
-    (treat_source_earned).
-
-    Returns:
-        line_mean: (N, L, D) — mean of hidden states across the line's tokens
-        line_last: (N, L, D) — hidden state at the last token of the line
-        labels:    (N,)
-        meta:      list of {keyword?, url, domain, label} for each row
-    """
+    """One forward pass; return (mean_X, last_X, y, meta) for that prompt's spans."""
     import torch
 
-    all_mean: list[np.ndarray] = []
-    all_last: list[np.ndarray] = []
-    all_labels: list[int] = []
-    all_meta: list[dict] = []
+    enc = tok(
+        prompt,
+        return_tensors="pt",
+        truncation=True,
+        max_length=max_len,
+        return_offsets_mapping=True,
+    ).to(device)
+    offsets = enc.offset_mapping[0].tolist()
+    model_kwargs = {k: v for k, v in enc.items() if k != "offset_mapping"}
+    out = model(**model_kwargs, output_hidden_states=True)
+    hs = torch.stack(out.hidden_states, dim=1).squeeze(0)  # (L, T, D)
+    T = hs.shape[1]
 
-    with torch.no_grad():
-        for prompt, spans in tqdm(prompts_with_spans, desc="t7-prompts"):
-            enc = tok(
-                prompt,
-                return_tensors="pt",
-                truncation=True,
-                max_length=max_len,
-                return_offsets_mapping=True,
-            ).to(device)
-            offsets = enc.offset_mapping[0].tolist()
-            # Drop offset_mapping before model call (some HF models reject it).
-            model_kwargs = {k: v for k, v in enc.items() if k != "offset_mapping"}
-            out = model(**model_kwargs, output_hidden_states=True)
-            hs = torch.stack(out.hidden_states, dim=1)  # (1, L, T, D)
-            hs = hs.squeeze(0)  # (L, T, D)
-            T = hs.shape[1]
+    means, lasts, labels, meta = [], [], [], []
+    for s in spans:
+        ls, le = s["line_span"]
+        idxs = [
+            i for i, (cs, ce) in enumerate(offsets)
+            if i < T and cs < le and ce > ls and not (cs == 0 and ce == 0)
+        ]
+        if not idxs:
+            continue
+        line_tokens = hs[:, idxs, :]
+        means.append(line_tokens.mean(dim=1).float().cpu().numpy())
+        lasts.append(hs[:, idxs[-1], :].float().cpu().numpy())
+        labels.append(int(s["label"]))
+        meta.append({
+            "url": s["url"], "domain": s["domain"], "label": int(s["label"]),
+        })
 
-            for s in spans:
-                ls, le = s["line_span"]
-                # Find token indices whose char range intersects [ls, le).
-                idxs = [
-                    i for i, (cs, ce) in enumerate(offsets)
-                    if i < T and cs < le and ce > ls and not (cs == 0 and ce == 0)
-                ]
-                if not idxs:
-                    # Line was truncated past max_len.
-                    continue
-                line_tokens = hs[:, idxs, :]  # (L, k, D)
-                mean_vec = line_tokens.mean(dim=1).float().cpu().numpy()
-                last_vec = hs[:, idxs[-1], :].float().cpu().numpy()
-                all_mean.append(mean_vec)
-                all_last.append(last_vec)
-                all_labels.append(int(s["label"]))
-                all_meta.append({
-                    "url": s["url"],
-                    "domain": s["domain"],
-                    "label": int(s["label"]),
-                })
-
-    if not all_mean:
+    if not means:
         return (np.empty((0, 0, 0)), np.empty((0, 0, 0)),
                 np.empty((0,), dtype=int), [])
     return (
-        np.stack(all_mean, axis=0),
-        np.stack(all_last, axis=0),
-        np.asarray(all_labels, dtype=int),
-        all_meta,
+        np.stack(means, axis=0),
+        np.stack(lasts, axis=0),
+        np.asarray(labels, dtype=int),
+        meta,
+    )
+
+
+def t7_in_context_hidden_states(
+    model, tok, keyword_prompts: list[tuple[str, str, list[dict]]],
+    device: str, max_len: int, chunk_dir: Path, ckpt: Checkpoint,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[dict]]:
+    """Resumable in-context probe data extraction for T7.
+
+    `keyword_prompts` is a list of (kw, prompt, spans). For each kw not yet
+    in the checkpoint, runs one forward pass and writes
+    `chunk_dir/<safe_kw>.npz` with mean_X / last_X / y / urls. Marks the kw
+    in the checkpoint immediately after the chunk is fsynced.
+
+    On every call (including restarts), all existing chunks are loaded and
+    concatenated before returning. So a kill mid-keyword loses at most that
+    one keyword.
+    """
+    import torch
+
+    chunk_dir.mkdir(parents=True, exist_ok=True)
+    done_kws = set(ckpt.data.get("t7_kws_done", []))
+
+    with torch.no_grad():
+        for kw, prompt, spans in tqdm(keyword_prompts, desc="t7-keywords"):
+            if kw in done_kws:
+                continue
+            try:
+                mean_X, last_X, y, meta = _t7_extract_one_prompt(
+                    model, tok, prompt, spans, device, max_len
+                )
+            except Exception as e:
+                print(f"[probing] T7 skip {kw!r}: {e}")
+                continue
+            if y.size == 0:
+                # Mark anyway so we don't retry every restart.
+                done_kws.add(kw)
+                ckpt.data["t7_kws_done"] = sorted(done_kws)
+                ckpt.save()
+                continue
+            chunk_path = chunk_dir / f"{_safe_kw(kw)}.npz"
+            tmp = chunk_path.with_suffix(".npz.tmp")
+            np.savez(
+                tmp,
+                mean_X=mean_X, last_X=last_X, y=y,
+                urls=np.array([m["url"] for m in meta], dtype=object),
+                domains=np.array([m["domain"] for m in meta], dtype=object),
+            )
+            tmp.replace(chunk_path)
+            done_kws.add(kw)
+            ckpt.data["t7_kws_done"] = sorted(done_kws)
+            ckpt.save()
+
+    return _t7_concat_chunks(chunk_dir)
+
+
+def _safe_kw(kw: str) -> str:
+    """Filesystem-safe keyword filename. md5 keeps it short and unique."""
+    import hashlib
+    h = hashlib.md5(kw.encode("utf-8")).hexdigest()[:16]
+    safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in kw)[:40]
+    return f"{safe}_{h}"
+
+
+def _t7_concat_chunks(chunk_dir: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[dict]]:
+    """Load all .npz chunks in chunk_dir and concat into a single dataset."""
+    means, lasts, ys, meta = [], [], [], []
+    for p in sorted(chunk_dir.glob("*.npz")):
+        try:
+            z = np.load(p, allow_pickle=True)
+        except Exception as e:
+            print(f"[probing] T7 chunk {p.name} unreadable ({e}); skipping")
+            continue
+        means.append(z["mean_X"])
+        lasts.append(z["last_X"])
+        ys.append(z["y"])
+        for u, d, lab in zip(z["urls"], z["domains"], z["y"]):
+            meta.append({"url": str(u), "domain": str(d), "label": int(lab)})
+    if not means:
+        return (np.empty((0, 0, 0)), np.empty((0, 0, 0)),
+                np.empty((0,), dtype=int), [])
+    return (
+        np.concatenate(means, axis=0),
+        np.concatenate(lasts, axis=0),
+        np.concatenate(ys, axis=0),
+        meta,
     )
 
 
@@ -363,7 +418,7 @@ def main() -> int:
 
     # T7 in-context: pick keywords whose SERP candidate pool has both earned
     # and non-earned URLs, so each prompt yields informative probe examples.
-    t7_prompts: list[tuple[str, list[dict]]] = []
+    t7_prompts: list[tuple[str, str, list[dict]]] = []  # (kw, prompt, spans)
     if "T7_source_earned" in PROBING_TREATMENTS:
         serp_df = load_serp(
             backend=args.t7_serp_backend, pool=args.t7_serp_pool,
@@ -385,6 +440,9 @@ def main() -> int:
             )
             if 0 < n_earned < len(top):
                 mixed_kws.append(kw)
+        # Deterministic order so resume across restarts hits the same keyword
+        # set even if the chunk dir is partially populated.
+        mixed_kws.sort()
         rng.shuffle(mixed_kws)
         chosen = mixed_kws[: args.t7_keywords]
         print(f"[probing] T7 keywords: {len(chosen)} (out of {len(mixed_kws)} mixed)")
@@ -394,7 +452,7 @@ def main() -> int:
             prompt, spans = build_rerank_prompt_with_spans(kw, top, top_n=10)
             for s in spans:
                 s["label"] = int(s["domain"] in earned_set)
-            t7_prompts.append((prompt, spans))
+            t7_prompts.append((kw, prompt, spans))
 
     model, tok = _load_model(args.model, device)
     if device == "cuda":
@@ -404,9 +462,15 @@ def main() -> int:
     all_rows: list[dict] = []
 
     # T7 first, while VRAM is freshest (full prompts can be ~2k tokens).
+    # Per-keyword chunked extraction: a kill loses at most one keyword.
+    # The probes themselves are trained at the end on the concatenation of
+    # all on-disk chunks, so a clean restart with --resume picks up exactly
+    # where we left off.
     if t7_prompts and not (args.resume and ckpt.seen("T7_source_earned")):
+        chunk_dir = out_dir / "t7_chunks"
         mean_X, last_X, y, _meta = t7_in_context_hidden_states(
-            model, tok, t7_prompts, device, max_len=args.t7_max_len,
+            model, tok, t7_prompts, device,
+            max_len=args.t7_max_len, chunk_dir=chunk_dir, ckpt=ckpt,
         )
         if len(y) >= 100 and y.sum() >= 10 and (len(y) - y.sum()) >= 10:
             print(f"[probing] T7 in-context: n={len(y)}  "
