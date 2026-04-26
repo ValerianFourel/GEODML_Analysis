@@ -24,7 +24,7 @@ from interpretability.utils import (
     Checkpoint,
     TREATMENT_TO_COL,
     _extract_domain,
-    build_rerank_prompt,
+    build_rerank_prompt_with_spans,
     data_root,
     load_main_table,
     load_serp,
@@ -68,18 +68,30 @@ def _embed_layer(model):
     raise RuntimeError("Could not locate input embedding layer")
 
 
-def saliency_over_prompt(model, tok, prompt: str, device: str):
-    """Return (tokens: list[str], saliency: np.ndarray) of length = input tokens.
+def saliency_over_prompt(model, tok, prompt: str, device: str, max_len: int = 2048):
+    """Return (tokens, saliency, offsets) of length = input tokens.
 
     Saliency = ||grad(loss) * embedding|| along the embedding dim, where loss
     is the log-prob of the model's first generated token. This is a cheap
     proxy for "which input tokens drove the ranking decision".
+
+    `offsets` is a list of (char_start, char_end) tuples mapping each token
+    back to its position in the original `prompt` string. (0,0) for special
+    tokens. Used to bind T7 saliency to the [domain] spans that the LLM
+    actually reads, instead of regex-matching arbitrary URL-shaped tokens.
     """
     import torch
 
-    enc = tok(prompt, return_tensors="pt", truncation=True, max_length=2048)
+    enc = tok(
+        prompt,
+        return_tensors="pt",
+        truncation=True,
+        max_length=max_len,
+        return_offsets_mapping=True,
+    )
     input_ids = enc.input_ids.to(device)
     attn = enc.attention_mask.to(device)
+    offsets = [tuple(o) for o in enc.offset_mapping[0].tolist()]
 
     emb_layer = _embed_layer(model)
     inputs_embeds = emb_layer(input_ids).detach().clone()
@@ -97,7 +109,31 @@ def saliency_over_prompt(model, tok, prompt: str, device: str):
     sal = (grads * inputs_embeds).detach().float().norm(dim=-1).squeeze(0).cpu().numpy()
 
     toks = tok.convert_ids_to_tokens(input_ids[0].tolist())
-    return toks, sal
+    return toks, sal, offsets
+
+
+def _earned_domain_set(main_df: pd.DataFrame) -> set[str]:
+    """Canonical T7 ground truth as observed in the dataset.
+
+    Built from rows where treat_source_earned == 1 (set by the original
+    pipeline via lookup against EARNED_DOMAINS). Using main_df avoids
+    duplicating the EARNED_DOMAINS list and stays in sync with whatever
+    set the DML coefficients were estimated on.
+    """
+    earned = main_df.loc[main_df["treat_source_earned"] == 1, "url"].dropna().unique()
+    return {_extract_domain(u) for u in earned}
+
+
+def _t7_token_tag(
+    char_start: int, char_end: int, earned_domain_spans: list[tuple[int, int]]
+) -> bool:
+    """True iff the token's char range overlaps any earned-URL [domain] span."""
+    if char_start == char_end:  # special token
+        return False
+    for ds, de in earned_domain_spans:
+        if char_start < de and char_end > ds:
+            return True
+    return False
 
 
 def sample_keywords(df: pd.DataFrame, n: int, rng: random.Random) -> list[dict]:
@@ -134,7 +170,22 @@ def main() -> int:
     ap.add_argument("--sample-n", type=int, default=200)
     ap.add_argument(
         "--model",
-        default=os.getenv("LOCAL_MODEL", "meta-llama/Llama-3.1-8B-Instruct"),
+        default=os.getenv("PRIMARY_MODEL", "meta-llama/Llama-3.3-70B-Instruct"),
+        help="Default is the ORIGINAL experiment model (Llama-3.3-70B). "
+             "Needs ~40 GB VRAM in 4-bit for forward, ~55 GB with backward. "
+             "Use --proxy for a quick 8B dev loop (not for paper numbers).",
+    )
+    ap.add_argument(
+        "--proxy", action="store_true",
+        help="Shortcut: use $PROXY_MODEL instead (8B). For dev only.",
+    )
+    ap.add_argument(
+        "--grad-checkpoint", action="store_true",
+        help="Enable gradient checkpointing to cut activation memory (~2x slower).",
+    )
+    ap.add_argument(
+        "--max-len", type=int, default=2048,
+        help="Max prompt length in tokens.",
     )
     ap.add_argument("--serp-pool", type=int, default=20)
     ap.add_argument("--serp-backend", default="searxng")
@@ -150,6 +201,10 @@ def main() -> int:
 
     rng = random.Random(args.seed)
     np.random.seed(args.seed)
+
+    if args.proxy:
+        args.model = os.getenv("PROXY_MODEL", "meta-llama/Llama-3.1-8B-Instruct")
+        print(f"[saliency] --proxy: using {args.model} (DEV ONLY; NOT for paper)")
 
     out_dir = Path(args.output_dir)
     (out_dir / "plots").mkdir(parents=True, exist_ok=True)
@@ -176,10 +231,24 @@ def main() -> int:
     serp_by_kw = {k: g.sort_values("position").to_dict("records")
                   for k, g in serp_df.groupby("keyword")}
 
+    earned_domains = _earned_domain_set(main_df)
+    print(f"[saliency] earned domains observed in main_df: {len(earned_domains)}")
+
     kws = sample_keywords(main_df, args.sample_n, rng)
     print(f"[saliency] keywords sampled: {len(kws)}")
 
     model, tok = _load_model(args.model, device)
+    if args.grad_checkpoint:
+        try:
+            model.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
+            # Checkpointing gates on self.training on most HF models.
+            # Llama-3.3 Instruct has dropout=0, so .train() is safe.
+            model.train()
+            print("[saliency] gradient checkpointing enabled")
+        except Exception as e:
+            print(f"[saliency] grad-checkpoint failed ({e}); continuing without")
     if device == "cuda":
         mem = torch.cuda.memory_allocated() / 1e9
         print(f"[saliency] GPU memory allocated after load: {mem:.2f} GB")
@@ -195,20 +264,32 @@ def main() -> int:
         if not cand:
             continue
         cand = cand[: args.serp_pool]
-        prompt = build_rerank_prompt(kw, cand, top_n=args.top_n)
+        prompt, spans = build_rerank_prompt_with_spans(kw, cand, top_n=args.top_n)
+
+        # Per-prompt T7 ground truth: only the [domain] spans of result
+        # lines whose URL is earned media. Anything outside these spans is
+        # NOT a T7-relevant token, regardless of how URL-shaped it looks.
+        earned_domain_spans = [
+            s["domain_span"] for s in spans
+            if s["domain"] in earned_domains
+        ]
 
         try:
-            toks, sal = saliency_over_prompt(model, tok, prompt, device)
+            toks, sal, offsets = saliency_over_prompt(
+                model, tok, prompt, device, max_len=args.max_len
+            )
         except Exception as e:
             print(f"[saliency] skip {kw}: {e}")
             continue
 
-        for i, (t, s) in enumerate(zip(toks, sal)):
+        for i, (t, s, (cs, ce)) in enumerate(zip(toks, sal, offsets)):
             # Strip leading special chars used by BPE (Ġ, ▁) for tagging only.
             clean = t.replace("Ġ", " ").replace("▁", " ").strip()
             if not clean:
                 continue
             tags = tag_token_for_treatment(clean)
+            if _t7_token_tag(cs, ce, earned_domain_spans):
+                tags.append("T7_source_earned")
             if tags:
                 for tag in tags:
                     buf.append({

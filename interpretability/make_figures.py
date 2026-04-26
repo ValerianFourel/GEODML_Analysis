@@ -130,6 +130,54 @@ def figure_c(output_dir: Path) -> Path:
     return out
 
 
+def figure_d(output_dir: Path) -> list[Path]:
+    """Two panels: logit-lens curve (left), head-importance heatmap (right)."""
+    lens_path = output_dir / "logit_lens.csv"
+    heads_path = output_dir / "attention_heads.csv"
+    outs: list[Path] = []
+
+    if lens_path.exists():
+        lens = pd.read_csv(lens_path)
+        curve = (lens.groupby("layer")["domain_token_prob_mass"]
+                 .agg(["mean", "sem"]).reset_index())
+        fig, ax = plt.subplots(figsize=(6.5, 4))
+        ax.plot(curve["layer"], curve["mean"], marker="o", lw=1.4, color="darkviolet")
+        ax.fill_between(
+            curve["layer"],
+            curve["mean"] - curve["sem"],
+            curve["mean"] + curve["sem"],
+            alpha=0.2, color="darkviolet",
+        )
+        ax.set_xlabel("layer")
+        ax.set_ylabel("P(domain-like token | decision position)")
+        ax.set_title("Figure D1 — Logit lens: when does the ranker decide on a domain?")
+        ax.grid(alpha=0.25)
+        out = output_dir / "plots" / "figure_d1_logit_lens.png"
+        fig.tight_layout()
+        fig.savefig(out, dpi=200)
+        plt.close(fig)
+        outs.append(out)
+        print(f"[fig D1] -> {out}")
+
+    if heads_path.exists():
+        heads = pd.read_csv(heads_path)
+        piv = (heads.groupby(["layer", "head"])["attn_to_url"].mean()
+               .unstack("head"))
+        fig, ax = plt.subplots(figsize=(9, 6))
+        sns.heatmap(piv, cmap="magma", ax=ax, cbar_kws={"label": "mean attn to URL"})
+        ax.set_title("Figure D2 — Attention head importance for URL tokens")
+        ax.set_xlabel("head")
+        ax.set_ylabel("layer")
+        out = output_dir / "plots" / "figure_d2_head_importance.png"
+        fig.tight_layout()
+        fig.savefig(out, dpi=200)
+        plt.close(fig)
+        outs.append(out)
+        print(f"[fig D2] -> {out}")
+
+    return outs
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument(
@@ -144,6 +192,7 @@ def main() -> int:
     figure_a(out, root)
     figure_b(out)
     figure_c(out)
+    figure_d(out)
     print("[make_figures] done.")
     return 0
 

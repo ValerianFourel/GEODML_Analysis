@@ -189,7 +189,12 @@ def main() -> int:
                 "meta-llama/Llama-3.3-70B-Instruct,Qwen/Qwen2.5-72B-Instruct",
             )
         else:
-            args.models = os.getenv("LOCAL_MODEL", "meta-llama/Llama-3.1-8B-Instruct")
+            # Default to the ORIGINAL experiment model so the numbers
+            # actually explain the paper's coefficients.
+            args.models = os.getenv(
+                "PRIMARY_MODEL",
+                "meta-llama/Llama-3.3-70B-Instruct",
+            )
     models = [m.strip() for m in args.models.split(",") if m.strip()]
     treatments = [t.strip() for t in args.treatments.split(",") if t.strip()]
     print(f"[ablation] backend={args.backend} models={models}")

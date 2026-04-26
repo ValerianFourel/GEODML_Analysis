@@ -26,8 +26,11 @@ from interpretability.utils import (
     Checkpoint,
     HTMLLoader,
     RUN_IDS,
+    _extract_domain,
+    build_rerank_prompt_with_spans,
     data_root,
     load_main_table,
+    load_serp,
     page_digest,
 )
 
@@ -87,6 +90,84 @@ def _load_model(model_name: str, device: str):
     model = AutoModel.from_pretrained(model_name, **kw)
     model.eval()
     return model, tok
+
+
+def t7_in_context_hidden_states(
+    model, tok, prompts_with_spans: list[tuple[str, list[dict]]],
+    device: str, max_len: int = 2048,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[dict]]:
+    """In-context probe data for T7.
+
+    For each (prompt, spans) tuple, run one forward pass on the full re-rank
+    prompt and pool hidden states over the token positions that fall inside
+    each candidate URL's result line. This binds the activations to the text
+    the LLM actually reads about each URL — the bracketed [domain] is the
+    only T7 signal in the prompt.
+
+    Each span dict must already include the URL's binary `label`
+    (treat_source_earned).
+
+    Returns:
+        line_mean: (N, L, D) — mean of hidden states across the line's tokens
+        line_last: (N, L, D) — hidden state at the last token of the line
+        labels:    (N,)
+        meta:      list of {keyword?, url, domain, label} for each row
+    """
+    import torch
+
+    all_mean: list[np.ndarray] = []
+    all_last: list[np.ndarray] = []
+    all_labels: list[int] = []
+    all_meta: list[dict] = []
+
+    with torch.no_grad():
+        for prompt, spans in tqdm(prompts_with_spans, desc="t7-prompts"):
+            enc = tok(
+                prompt,
+                return_tensors="pt",
+                truncation=True,
+                max_length=max_len,
+                return_offsets_mapping=True,
+            ).to(device)
+            offsets = enc.offset_mapping[0].tolist()
+            # Drop offset_mapping before model call (some HF models reject it).
+            model_kwargs = {k: v for k, v in enc.items() if k != "offset_mapping"}
+            out = model(**model_kwargs, output_hidden_states=True)
+            hs = torch.stack(out.hidden_states, dim=1)  # (1, L, T, D)
+            hs = hs.squeeze(0)  # (L, T, D)
+            T = hs.shape[1]
+
+            for s in spans:
+                ls, le = s["line_span"]
+                # Find token indices whose char range intersects [ls, le).
+                idxs = [
+                    i for i, (cs, ce) in enumerate(offsets)
+                    if i < T and cs < le and ce > ls and not (cs == 0 and ce == 0)
+                ]
+                if not idxs:
+                    # Line was truncated past max_len.
+                    continue
+                line_tokens = hs[:, idxs, :]  # (L, k, D)
+                mean_vec = line_tokens.mean(dim=1).float().cpu().numpy()
+                last_vec = hs[:, idxs[-1], :].float().cpu().numpy()
+                all_mean.append(mean_vec)
+                all_last.append(last_vec)
+                all_labels.append(int(s["label"]))
+                all_meta.append({
+                    "url": s["url"],
+                    "domain": s["domain"],
+                    "label": int(s["label"]),
+                })
+
+    if not all_mean:
+        return (np.empty((0, 0, 0)), np.empty((0, 0, 0)),
+                np.empty((0,), dtype=int), [])
+    return (
+        np.stack(all_mean, axis=0),
+        np.stack(all_last, axis=0),
+        np.asarray(all_labels, dtype=int),
+        all_meta,
+    )
 
 
 def hidden_states_for_texts(
@@ -195,12 +276,29 @@ def main() -> int:
     ap.add_argument("--sample-n", type=int, default=2000)
     ap.add_argument(
         "--model",
-        default=os.getenv("LOCAL_MODEL", "meta-llama/Llama-3.1-8B-Instruct"),
+        default=os.getenv("PRIMARY_MODEL", "meta-llama/Llama-3.3-70B-Instruct"),
+        help="Default is the ORIGINAL experiment model. Forward-only, so "
+             "~42 GB VRAM in 4-bit. Fits on H100-80G or 2x A100-40G.",
+    )
+    ap.add_argument(
+        "--proxy", action="store_true",
+        help="Shortcut: use $PROXY_MODEL (8B) for dev only.",
     )
     ap.add_argument("--run-filter", default=None,
                     help="If set, restrict to one run_id (saves HTML-loading time).")
     ap.add_argument("--max-len", type=int, default=512)
     ap.add_argument("--batch-size", type=int, default=4)
+    # T7 uses an in-context probe (full re-rank prompt + per-URL line spans)
+    # because T7 is a domain-list label — the ranker only ever sees [domain],
+    # never the page body, so probing body digests is the wrong question.
+    ap.add_argument("--t7-keywords", type=int, default=200,
+                    help="Number of keywords for the T7 in-context probe.")
+    ap.add_argument("--t7-max-len", type=int, default=2048,
+                    help="Max prompt length (tokens) for T7 in-context probe.")
+    ap.add_argument("--t7-serp-pool", type=int, default=20,
+                    help="Candidates per prompt for T7 in-context probe.")
+    ap.add_argument("--t7-serp-backend", default="searxng",
+                    help="searxng or ddg — SERP source for T7 in-context probe.")
     ap.add_argument("--data-root", default=None)
     ap.add_argument(
         "--output-dir",
@@ -212,6 +310,10 @@ def main() -> int:
 
     rng = random.Random(args.seed)
     np_rng = np.random.default_rng(args.seed)
+
+    if args.proxy:
+        args.model = os.getenv("PROXY_MODEL", "meta-llama/Llama-3.1-8B-Instruct")
+        print(f"[probing] --proxy: using {args.model} (DEV ONLY; NOT for paper)")
 
     out_dir = Path(args.output_dir)
     (out_dir / "plots").mkdir(parents=True, exist_ok=True)
@@ -236,21 +338,63 @@ def main() -> int:
     if default_run not in RUN_IDS:
         print(f"[probing] WARNING: {default_run} not in known RUN_IDS")
 
-    # Build one digest dataset once, reuse across treatments.
+    # T7 takes the in-context path (no body-digest sampling needed).
+    digest_treatments = {
+        k: v for k, v in PROBING_TREATMENTS.items() if k != "T7_source_earned"
+    }
+
+    # Build one digest dataset once, reuse across (non-T7) treatments.
     per_treatment_samples: dict[str, pd.DataFrame] = {}
-    for label, (col, kind) in PROBING_TREATMENTS.items():
+    for label, (col, kind) in digest_treatments.items():
         sub = sample_balanced(df, col, kind, args.sample_n, rng)
         if sub.empty:
             print(f"[probing] skip {label} — no variance in {col}")
             continue
         per_treatment_samples[label] = sub
 
-    # Union of URLs across all treatments (digests are expensive to build).
-    all_sub = pd.concat(per_treatment_samples.values(), ignore_index=True)
-    all_sub = all_sub.drop_duplicates(subset=["run_id", "url"])
-    digests = build_digest_table(all_sub, data_root(args.data_root), default_run)
-    digest_map = dict(zip(digests["url"], digests["digest"]))
-    print(f"[probing] digests available: {len(digest_map)}")
+    if per_treatment_samples:
+        all_sub = pd.concat(per_treatment_samples.values(), ignore_index=True)
+        all_sub = all_sub.drop_duplicates(subset=["run_id", "url"])
+        digests = build_digest_table(all_sub, data_root(args.data_root), default_run)
+        digest_map = dict(zip(digests["url"], digests["digest"]))
+        print(f"[probing] digests available: {len(digest_map)}")
+    else:
+        digest_map = {}
+
+    # T7 in-context: pick keywords whose SERP candidate pool has both earned
+    # and non-earned URLs, so each prompt yields informative probe examples.
+    t7_prompts: list[tuple[str, list[dict]]] = []
+    if "T7_source_earned" in PROBING_TREATMENTS:
+        serp_df = load_serp(
+            backend=args.t7_serp_backend, pool=args.t7_serp_pool,
+            root=args.data_root,
+        )
+        serp_by_kw = {k: g.sort_values("position").to_dict("records")
+                      for k, g in serp_df.groupby("keyword")}
+        earned_set = {
+            _extract_domain(u)
+            for u in df.loc[df["treat_source_earned"] == 1, "url"].dropna().unique()
+        }
+        print(f"[probing] T7 earned domains: {len(earned_set)}")
+
+        mixed_kws: list[str] = []
+        for kw, results in serp_by_kw.items():
+            top = results[: args.t7_serp_pool]
+            n_earned = sum(
+                1 for r in top if _extract_domain(r["url"]) in earned_set
+            )
+            if 0 < n_earned < len(top):
+                mixed_kws.append(kw)
+        rng.shuffle(mixed_kws)
+        chosen = mixed_kws[: args.t7_keywords]
+        print(f"[probing] T7 keywords: {len(chosen)} (out of {len(mixed_kws)} mixed)")
+
+        for kw in chosen:
+            top = serp_by_kw[kw][: args.t7_serp_pool]
+            prompt, spans = build_rerank_prompt_with_spans(kw, top, top_n=10)
+            for s in spans:
+                s["label"] = int(s["domain"] in earned_set)
+            t7_prompts.append((prompt, spans))
 
     model, tok = _load_model(args.model, device)
     if device == "cuda":
@@ -258,6 +402,29 @@ def main() -> int:
         print(f"[probing] GPU memory after load: {mem:.2f} GB")
 
     all_rows: list[dict] = []
+
+    # T7 first, while VRAM is freshest (full prompts can be ~2k tokens).
+    if t7_prompts and not (args.resume and ckpt.seen("T7_source_earned")):
+        mean_X, last_X, y, _meta = t7_in_context_hidden_states(
+            model, tok, t7_prompts, device, max_len=args.t7_max_len,
+        )
+        if len(y) >= 100 and y.sum() >= 10 and (len(y) - y.sum()) >= 10:
+            print(f"[probing] T7 in-context: n={len(y)}  "
+                  f"pos_frac={y.mean():.3f}  hidden={mean_X.shape}")
+            rows = []
+            rows += train_probes(last_X, y, "last_token", "T7_source_earned", np_rng)
+            rows += train_probes(mean_X, y, "mean", "T7_source_earned", np_rng)
+            all_rows.extend(rows)
+            mode = "a" if out_path.exists() else "w"
+            pd.DataFrame(rows).to_csv(
+                out_path, mode=mode, header=(mode == "w"), index=False
+            )
+            ckpt.mark("T7_source_earned")
+            ckpt.save()
+        else:
+            print(f"[probing] T7 in-context: insufficient data (n={len(y)}, "
+                  f"pos={int(y.sum())}); skipping")
+
     for label, sub in per_treatment_samples.items():
         if args.resume and ckpt.seen(label):
             print(f"[probing] skipping {label} (already in checkpoint)")

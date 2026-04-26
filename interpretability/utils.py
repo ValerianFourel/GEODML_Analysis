@@ -203,21 +203,20 @@ def _extract_domain(url: str) -> str:
     return host
 
 
-def build_rerank_prompt(
+def build_rerank_prompt_with_spans(
     keyword: str, search_results: list[dict], top_n: int = 10
-) -> str:
-    """Exact template used in the original experiment.
+) -> tuple[str, list[dict]]:
+    """Exact template used in the original experiment, plus per-result char spans.
 
-    `search_results` items must have keys: position, title, url, snippet.
+    Returns:
+        prompt: the full prompt string
+        spans: one dict per result with keys
+            - position, url, domain
+            - line_span: (char_start, char_end) of the result line within prompt
+            - domain_span: (char_start, char_end) of the bare domain (no brackets)
+              within prompt — this is the only T7 signal the LLM actually sees.
     """
-    results_text = ""
-    for r in search_results:
-        domain = _extract_domain(r["url"])
-        snippet = (r.get("snippet") or "")[:150]
-        results_text += (
-            f"{r['position']}. [{domain}] {r['title']} — {snippet}\n"
-        )
-    return (
+    header_top = (
         f"Search keyword: {keyword}\n\n"
         f"Below are search engine results for the above keyword. Re-rank the "
         f"results and return the top {top_n} software product domains, ordered "
@@ -225,9 +224,52 @@ def build_rerank_prompt(
         f"Exclude non-product sites: review aggregators, directories, Wikipedia, "
         f"news, blogs, forums, YouTube.\n\n"
         f"Return only root domains, one per line. No explanations.\n\n"
-        f"Search results:\n{results_text}\n"
-        f"Re-ranked product domains:"
+        f"Search results:\n"
     )
+
+    spans: list[dict] = []
+    parts: list[str] = []
+    cursor = 0  # offset within the assembled results_text
+    for r in search_results:
+        domain = _extract_domain(r["url"])
+        snippet = (r.get("snippet") or "")[:150]
+        prefix = f"{r['position']}. ["
+        line = f"{prefix}{domain}] {r['title']} — {snippet}\n"
+        line_start = cursor
+        domain_start = cursor + len(prefix)
+        domain_end = domain_start + len(domain)
+        line_end = cursor + len(line)
+        parts.append(line)
+        spans.append({
+            "position": r["position"],
+            "url": r["url"],
+            "domain": domain,
+            "line_span": (line_start, line_end),
+            "domain_span": (domain_start, domain_end),
+        })
+        cursor = line_end
+    results_text = "".join(parts)
+
+    prompt = header_top + results_text + "\nRe-ranked product domains:"
+    base = len(header_top)
+    for s in spans:
+        ls, le = s["line_span"]
+        ds, de = s["domain_span"]
+        s["line_span"] = (base + ls, base + le)
+        s["domain_span"] = (base + ds, base + de)
+
+    return prompt, spans
+
+
+def build_rerank_prompt(
+    keyword: str, search_results: list[dict], top_n: int = 10
+) -> str:
+    """Exact template used in the original experiment.
+
+    `search_results` items must have keys: position, title, url, snippet.
+    """
+    prompt, _ = build_rerank_prompt_with_spans(keyword, search_results, top_n=top_n)
+    return prompt
 
 
 def parse_ranked_domains(llm_output: str) -> list[str]:
@@ -445,22 +487,24 @@ NUMERIC_RE = re.compile(r"\b\d+\b")
 QUESTION_RE = re.compile(r"\?")
 SCHEMA_RE = re.compile(r"(schema|structured|json-?ld)", re.I)
 YEAR_RE = re.compile(r"\b(19|20)\d{2}\b")
-URL_HINT_RE = re.compile(r"(https?://|www\.|\.com|\.io|\.org|\.net)", re.I)
-EARNED_HINT_RE = re.compile(r"\b(official|review|best|top|vs|alternatives?)\b", re.I)
 
 
 def tag_token_for_treatment(tok: str) -> list[str]:
-    """Return all treatment tags that this token matches."""
+    """Return all treatment tags that this token matches.
+
+    Note: T7_source_earned is intentionally NOT tagged here. T7 is a
+    domain-list classification — the LLM's only signal is the bracketed
+    [domain] in each result line, conditional on that URL being earned
+    media. Saliency tags T7 from prompt-level character spans instead
+    (see build_rerank_prompt_with_spans + saliency.py).
+    """
     tags: list[str] = []
     if NUMERIC_RE.search(tok):
         tags.append("T1b_stats_density")
     if QUESTION_RE.search(tok):
         tags.append("T2a_question_headings")
-    if SCHEMA_RE.search(tok) or YEAR_RE.search(tok):
-        if SCHEMA_RE.search(tok):
-            tags.append("T3_structured_data_new")
-        if YEAR_RE.search(tok):
-            tags.append("T6_freshness")
-    if URL_HINT_RE.search(tok) or EARNED_HINT_RE.search(tok):
-        tags.append("T7_source_earned")
+    if SCHEMA_RE.search(tok):
+        tags.append("T3_structured_data_new")
+    if YEAR_RE.search(tok):
+        tags.append("T6_freshness")
     return tags

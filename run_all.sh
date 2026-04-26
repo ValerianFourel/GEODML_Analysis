@@ -37,8 +37,12 @@ python scripts/download_data.py --no-download --extract-html
 echo "==> 4/5  Option 2 — Saliency (local GPU, ~1-2 h)"
 python -m interpretability.saliency --sample-n "$SAMPLE_SAL" --resume
 
-echo "==> 5/5  Option 3 — Probing (local GPU, ~30-60 min)"
+echo "==> 5/6  Option 3 — Probing (local GPU, ~30-60 min)"
 python -m interpretability.probing --sample-n "$SAMPLE_PROBE" --resume
+
+SAMPLE_WEIGHTS="${SAMPLE_WEIGHTS:-100}"
+echo "==> 6/6  Option 4 — Weight-space analysis (logit lens + head importance)"
+python -m interpretability.weight_analysis --sample-n "$SAMPLE_WEIGHTS" --resume
 
 echo "==> figures"
 python -m interpretability.make_figures
