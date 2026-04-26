@@ -20,6 +20,7 @@ checkpoints/
 # caches
 .cache/
 .hf_cache/
+hf_cache/
 .huggingface/
 __pycache__/
 *.pyc
