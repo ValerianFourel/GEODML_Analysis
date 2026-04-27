@@ -129,7 +129,11 @@ def load_robust_winner_pairs(
             source = "HF datasets"
         pairs = _derive_pairs(df)
         CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        pairs.to_parquet(CACHE_PATH, index=False)
+        # Atomic write so concurrent SLURM jobs racing the same fresh cache
+        # never observe a partial parquet.
+        tmp = CACHE_PATH.with_suffix(f".tmp.{os.getpid()}.parquet")
+        pairs.to_parquet(tmp, index=False)
+        os.replace(tmp, CACHE_PATH)
         print(f"[robust] derived {len(pairs)} pairs from {source} -> {CACHE_PATH}")
 
     if verify:

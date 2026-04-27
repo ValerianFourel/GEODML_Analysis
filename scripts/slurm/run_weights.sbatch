@@ -1,0 +1,51 @@
+#!/bin/bash -l
+# Weight-analysis chunk: one model, all eligible keywords. Forward-only,
+# typically 1.5-2.5 h, so a single 24 h walltime is plenty.
+#
+# Required exports: MODEL
+# Optional:         SAMPLE_N (default huge), ATTEMPT, MAX_ATTEMPTS
+
+#SBATCH --partition=booster
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=48
+#SBATCH --gres=gpu:4
+#SBATCH --time=23:55:00
+#SBATCH --job-name=geodml-wgt
+#SBATCH --output=logs/%x-%j.out
+#SBATCH --error=logs/%x-%j.err
+#SBATCH --requeue
+
+# shellcheck source=scripts/slurm/_common.sh
+source "$SLURM_SUBMIT_DIR/scripts/slurm/_common.sh"
+
+: "${MODEL:?MODEL must be set, e.g. meta-llama/Llama-3.3-70B-Instruct}"
+: "${SAMPLE_N:=100000}"
+
+MODEL_TAG="${MODEL##*/}"
+OUTDIR="$SLURM_SUBMIT_DIR/interpretability/output/weights_${MODEL_TAG}"
+mkdir -p "$OUTDIR"
+
+echo "[weights] model=$MODEL sample_n=$SAMPLE_N"
+echo "[weights] outdir=$OUTDIR"
+
+set +e
+python -m interpretability.weight_analysis \
+  --model "$MODEL" \
+  --sample-n "$SAMPLE_N" \
+  --resume \
+  --output-dir "$OUTDIR"
+RC=$?
+set -e
+
+echo "[weights] python rc=$RC"
+if [ "$RC" -eq 0 ]; then
+  touch "$OUTDIR/.done_${MODEL_TAG}"
+  echo "[weights] complete -- chain stops here."
+  exit 0
+fi
+
+chain_resubmit "$0" \
+  MODEL="$MODEL" SAMPLE_N="$SAMPLE_N" \
+  || exit "$RC"
+exit 0
