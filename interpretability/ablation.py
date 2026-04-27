@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import os
 import random
+import traceback
 from pathlib import Path
 
 import numpy as np
@@ -259,6 +260,7 @@ def main() -> int:
 
         all_rows: list[dict] = []
         rng = random.Random(args.seed)  # reset per-frame so kw sample is reproducible
+        rank_err_count = 0
         for treatment in treatments:
             kws = stratified_keyword_sample(main_df_frame, treatment, args.sample_n, rng)
             if not kws:
@@ -287,7 +289,11 @@ def main() -> int:
                             build_rerank_prompt(kw, ablated, top_n=args.top_n)
                         )
                     except Exception as e:
-                        print(f"[ablation] API error for ({kw},{treatment},{model}): {e}")
+                        rank_err_count += 1
+                        print(f"[ablation] rank failed for ({kw},{treatment},{model}): "
+                              f"{type(e).__name__}: {e!r}")
+                        if rank_err_count <= 3:
+                            traceback.print_exc()
                         continue
 
                     base_ranks = rank_positions(parse_ranked_domains(base_out), cand)

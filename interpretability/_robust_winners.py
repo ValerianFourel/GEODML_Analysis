@@ -61,9 +61,14 @@ def _ensure_category_cols(df: pd.DataFrame) -> pd.DataFrame:
 
     If absent, parse them from `run_id` (every row in the main table carries
     a run_id of the form `{engine}_{model}_serp{pool}_top{N}`).
+
+    Always normalises `llm_model` to the short form (no `org/` prefix) so the
+    derived pairs match how callers look them up via `short_model_name()`.
     """
     needed = {"search_engine", "llm_model", "serp_pool_size"}
     if needed.issubset(df.columns):
+        df = df.copy()
+        df["llm_model"] = df["llm_model"].astype(str).map(short_model_name)
         return df
     if "run_id" not in df.columns:
         raise ValueError(
@@ -76,7 +81,7 @@ def _ensure_category_cols(df: pd.DataFrame) -> pd.DataFrame:
         raise ValueError(f"unparseable run_ids: {list(bad)}")
     df = df.copy()
     df["search_engine"] = parsed.map(lambda t: t[0])
-    df["llm_model"] = parsed.map(lambda t: t[1])
+    df["llm_model"] = parsed.map(lambda t: short_model_name(t[1]))
     df["serp_pool_size"] = parsed.map(lambda t: t[2]).astype(int)
     return df
 
