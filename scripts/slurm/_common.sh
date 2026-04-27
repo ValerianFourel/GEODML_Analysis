@@ -78,7 +78,16 @@ chain_resubmit() {
   fi
   local next=$((attempt + 1))
   echo "[chain] queueing attempt $next/$max with --dependency=afterany:$SLURM_JOB_ID"
+  # JSC's submit filter requires --account on every sbatch even when ALL is
+  # forwarded — env exports don't satisfy it. Pull it from JUWELS_ACCOUNT.
+  local account_arg=()
+  if [ -n "${JUWELS_ACCOUNT:-}" ]; then
+    account_arg=(--account="$JUWELS_ACCOUNT")
+  else
+    echo "[chain] WARNING: JUWELS_ACCOUNT unset; sbatch will likely reject the submission."
+  fi
   sbatch \
+    "${account_arg[@]}" \
     --dependency=afterany:"$SLURM_JOB_ID" \
     --export="ALL,ATTEMPT=$next,MAX_ATTEMPTS=$max${extra:+,$extra}" \
     "$script"

@@ -187,7 +187,10 @@ def t7_in_context_hidden_states(
                 ckpt.save()
                 continue
             chunk_path = chunk_dir / f"{_safe_kw(kw)}.npz"
-            tmp = chunk_path.with_suffix(".npz.tmp")
+            # Use .tmp.npz (not .npz.tmp): np.savez auto-appends .npz when the
+            # filename doesn't already end in .npz, which would write to
+            # foo.npz.tmp.npz and then this rename would fail with ENOENT.
+            tmp = chunk_path.with_suffix(".tmp.npz")
             np.savez(
                 tmp,
                 mean_X=mean_X, last_X=last_X, y=y,
