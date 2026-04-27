@@ -440,17 +440,33 @@ class LocalRanker:
     def rank(self, prompt: str, max_tokens: int = 500, temperature: float = 0.1) -> str:
         import torch
 
+        attention_mask = None
         if self._has_chat_template:
             messages = [{"role": "user", "content": prompt}]
-            input_ids = self.tok.apply_chat_template(
+            tok_out = self.tok.apply_chat_template(
                 messages, add_generation_prompt=True, return_tensors="pt"
-            ).to(self.device)
+            )
+            # Some transformers versions (>= 4.45) return a BatchEncoding here
+            # instead of a raw Tensor; passing the dict to model.generate then
+            # blows up with `BatchEncoding has no attribute 'shape'`. Normalise.
+            if hasattr(tok_out, "input_ids"):
+                input_ids = tok_out["input_ids"]
+                attention_mask = tok_out.get("attention_mask")
+            else:
+                input_ids = tok_out
         else:
-            input_ids = self.tok(prompt, return_tensors="pt").input_ids.to(self.device)
+            enc = self.tok(prompt, return_tensors="pt")
+            input_ids = enc.input_ids
+            attention_mask = enc.get("attention_mask")
+
+        input_ids = input_ids.to(self.device)
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(self.device)
 
         with torch.no_grad():
             out = self.model.generate(
                 input_ids=input_ids,
+                attention_mask=attention_mask,
                 max_new_tokens=max_tokens,
                 do_sample=temperature > 0,
                 temperature=max(temperature, 1e-5),
