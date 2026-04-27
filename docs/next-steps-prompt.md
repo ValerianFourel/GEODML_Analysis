@@ -77,6 +77,43 @@ proxy model to `$HF_HOME`.
 
 ---
 
+## 3.1. Frame selection (`--frame`)
+
+All three scripts (ablation, saliency, probing) accept `--frame
+{full,robust_winners,both}` (default: **both**).
+
+- **`full`** — sample from all keywords / all candidate URLs in the main
+  table. Same behavior as the pre-2026-04-26 pipeline.
+- **`robust_winners`** — restrict to (keyword, url) pairs the LLM picked
+  in top-10 under both serp20 *and* serp50 pools (within one engine + model
+  category). This is the same conditioning the §4.1 DML headline
+  coefficients use; it isolates the position effect from the selection
+  effect (median Jaccard top-10 overlap across pools is only 0.22-0.31, so
+  this set is materially smaller).
+- **`both`** runs each frame end-to-end. Outputs are tagged so `full` and
+  `robust_winners` results sit side-by-side.
+
+**Output naming.** Ablation and saliency write per-frame CSVs:
+`ablation_results_full.csv` / `ablation_results_rw.csv`,
+`saliency_summary_full.csv` / `saliency_summary_rw.csv`. Probing writes a
+single `probing_results.csv` with a `frame` column so Figure C can plot
+both curves on shared axes. Per-frame checkpoints
+(`checkpoint_<stage>_full.json`, `checkpoint_<stage>_rw.json`) keep
+resumption isolated. Plots: `figure_a_ablation_<frame>.png`,
+`figure_b_saliency_<frame>.png`, `figure_c_probing.png`.
+
+**Pair derivation.** `interpretability/_robust_winners.py` derives the
+robust-pair set on first call from the local `main` parquet (or HF
+dataset as fallback) and caches to `interpretability/output/_robust_pairs.parquet`
+for the day. At startup it prints per-category counts and warns >10%
+drift from the 2026-04-26 reference (ddg+Llama≈2,187, ddg+Qwen≈2,572,
+searxng+Llama≈2,386, searxng+Qwen≈3,031).
+
+**Recommended defaults per script.** All three default to `both`.
+For paper figures, prefer the `_rw` outputs as headline; report `_full`
+as a sensitivity check. Saliency in particular has no clean reading on
+pages the LLM never picks — running `--frame full` alone logs a notice.
+
 ## 4. Execution order
 
 Follow this order. Each step is resumable via `--resume`; checkpoints

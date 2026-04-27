@@ -7,6 +7,13 @@ Hypothesis: saliency ratio (treatment-relevant tokens / other tokens) is
 high for treatments with strong DML coefficients (T7, T5).
 
 Runtime: ~1-2 h on A100-40G or RTX 4090 with N=200 examples.
+
+Frames (--frame): saliency is only meaningful on pages the LLM actually
+ranks, so `robust_winners` (keep only keywords with at least one
+LLM-stable winner for the chosen engine+model) is the recommended frame
+for paper figures. `full` is kept for diagnostics; a notice is logged
+when full is chosen on its own. `both` (default) runs each frame
+end-to-end and writes side-by-side outputs.
 """
 
 from __future__ import annotations
@@ -20,6 +27,11 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
+from interpretability._robust_winners import (
+    engine_from_serp_backend,
+    load_robust_winner_pairs,
+    short_model_name,
+)
 from interpretability.utils import (
     Checkpoint,
     TREATMENT_TO_COL,
@@ -30,6 +42,9 @@ from interpretability.utils import (
     load_serp,
     tag_token_for_treatment,
 )
+
+
+FRAME_SUFFIX = {"full": "_full", "robust_winners": "_rw"}
 
 
 def _load_model(model_name: str, device: str):
@@ -197,10 +212,14 @@ def main() -> int:
     )
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument(
+        "--frame", choices=("full", "robust_winners", "both"), default="both",
+        help="Sample frame. 'robust_winners' restricts the keyword sample to "
+             "keywords with at least one LLM-stable winner for engine+model — "
+             "the conditioning under which saliency has a coherent reading. "
+             "'both' runs each frame end-to-end.",
+    )
     args = ap.parse_args()
-
-    rng = random.Random(args.seed)
-    np.random.seed(args.seed)
 
     if args.proxy:
         args.model = os.getenv("PROXY_MODEL", "meta-llama/Llama-3.1-8B-Instruct")
@@ -208,9 +227,6 @@ def main() -> int:
 
     out_dir = Path(args.output_dir)
     (out_dir / "plots").mkdir(parents=True, exist_ok=True)
-    scores_path = out_dir / "saliency_scores.csv"
-    summary_path = out_dir / "saliency_summary.csv"
-    ckpt = Checkpoint.load(out_dir / "checkpoint_saliency.json")
 
     try:
         import torch
@@ -234,8 +250,14 @@ def main() -> int:
     earned_domains = _earned_domain_set(main_df)
     print(f"[saliency] earned domains observed in main_df: {len(earned_domains)}")
 
-    kws = sample_keywords(main_df, args.sample_n, rng)
-    print(f"[saliency] keywords sampled: {len(kws)}")
+    frames = ["full", "robust_winners"] if args.frame == "both" else [args.frame]
+    if frames == ["full"]:
+        print("[saliency] NOTE: frame=full is diagnostic only. Saliency on "
+              "pages the LLM never picked has no clean interpretation; the "
+              "paper's headline numbers come from frame=robust_winners.")
+    pairs = load_robust_winner_pairs() if "robust_winners" in frames else None
+    engine = engine_from_serp_backend(args.serp_backend)
+    short_model = short_model_name(args.model)
 
     model, tok = _load_model(args.model, device)
     if args.grad_checkpoint:
@@ -253,103 +275,133 @@ def main() -> int:
         mem = torch.cuda.memory_allocated() / 1e9
         print(f"[saliency] GPU memory allocated after load: {mem:.2f} GB")
 
-    done: set[str] = set(ckpt.data.get("seen", []))
-    buf: list[dict] = []
-    header_written = scores_path.exists() and args.resume
+    for frame in frames:
+        suffix = FRAME_SUFFIX[frame]
+        scores_path = out_dir / f"saliency_scores{suffix}.csv"
+        summary_path = out_dir / f"saliency_summary{suffix}.csv"
+        ckpt = Checkpoint.load(out_dir / f"checkpoint_saliency{suffix}.json")
 
-    for kw in tqdm(kws, desc="keywords"):
-        if kw in done:
-            continue
-        cand = serp_by_kw.get(kw)
-        if not cand:
-            continue
-        cand = cand[: args.serp_pool]
-        prompt, spans = build_rerank_prompt_with_spans(kw, cand, top_n=args.top_n)
+        print(f"\n[saliency] === frame={frame} -> {scores_path.name} ===")
 
-        # Per-prompt T7 ground truth: only the [domain] spans of result
-        # lines whose URL is earned media. Anything outside these spans is
-        # NOT a T7-relevant token, regardless of how URL-shaped it looks.
-        earned_domain_spans = [
-            s["domain_span"] for s in spans
-            if s["domain"] in earned_domains
-        ]
+        rng = random.Random(args.seed)  # reproducible per-frame sampling
+        np.random.seed(args.seed)
 
-        try:
-            toks, sal, offsets = saliency_over_prompt(
-                model, tok, prompt, device, max_len=args.max_len
-            )
-        except Exception as e:
-            print(f"[saliency] skip {kw}: {e}")
-            continue
-
-        for i, (t, s, (cs, ce)) in enumerate(zip(toks, sal, offsets)):
-            # Strip leading special chars used by BPE (Ġ, ▁) for tagging only.
-            clean = t.replace("Ġ", " ").replace("▁", " ").strip()
-            if not clean:
+        if frame == "robust_winners":
+            p = pairs[(pairs["search_engine"] == engine)
+                      & (pairs["llm_model"] == short_model)]
+            allowed_kws = set(p["keyword"].unique())
+            if not allowed_kws:
+                print(f"[saliency] no robust pairs for engine={engine} "
+                      f"model={short_model}; skipping frame.")
                 continue
-            tags = tag_token_for_treatment(clean)
-            if _t7_token_tag(cs, ce, earned_domain_spans):
-                tags.append("T7_source_earned")
-            if tags:
-                for tag in tags:
-                    buf.append({
-                        "keyword": kw,
-                        "token": clean,
-                        "pos": i,
-                        "saliency_score": float(s),
-                        "treatment": tag,
-                        "is_treatment_token": 1,
-                        "model": args.model,
-                    })
-            else:
-                # Sample ~10% of non-treatment tokens as the "other" baseline
-                # to keep the CSV size bounded.
-                if rng.random() < 0.1:
-                    buf.append({
-                        "keyword": kw,
-                        "token": clean,
-                        "pos": i,
-                        "saliency_score": float(s),
-                        "treatment": "OTHER",
-                        "is_treatment_token": 0,
-                        "model": args.model,
-                    })
+            main_df_frame = main_df[main_df["keyword"].isin(allowed_kws)]
+            print(f"[saliency] robust keywords for {engine}+{short_model}: "
+                  f"{len(allowed_kws)}")
+        else:
+            main_df_frame = main_df
 
-        ckpt.mark(kw)
-        if len(buf) >= 1000:
+        kws = sample_keywords(main_df_frame, args.sample_n, rng)
+        print(f"[saliency] keywords sampled: {len(kws)}")
+
+        done: set[str] = set(ckpt.data.get("seen", []))
+        buf: list[dict] = []
+        header_written = scores_path.exists() and args.resume
+
+        for kw in tqdm(kws, desc=f"{frame}:keywords"):
+            if kw in done:
+                continue
+            cand = serp_by_kw.get(kw)
+            if not cand:
+                continue
+            cand = cand[: args.serp_pool]
+            prompt, spans = build_rerank_prompt_with_spans(kw, cand, top_n=args.top_n)
+
+            # Per-prompt T7 ground truth: only the [domain] spans of result
+            # lines whose URL is earned media. Anything outside these spans is
+            # NOT a T7-relevant token, regardless of how URL-shaped it looks.
+            earned_domain_spans = [
+                s["domain_span"] for s in spans
+                if s["domain"] in earned_domains
+            ]
+
+            try:
+                toks, sal, offsets = saliency_over_prompt(
+                    model, tok, prompt, device, max_len=args.max_len
+                )
+            except Exception as e:
+                print(f"[saliency] skip {kw}: {e}")
+                continue
+
+            for i, (t, s, (cs, ce)) in enumerate(zip(toks, sal, offsets)):
+                # Strip leading special chars used by BPE (Ġ, ▁) for tagging only.
+                clean = t.replace("Ġ", " ").replace("▁", " ").strip()
+                if not clean:
+                    continue
+                tags = tag_token_for_treatment(clean)
+                if _t7_token_tag(cs, ce, earned_domain_spans):
+                    tags.append("T7_source_earned")
+                if tags:
+                    for tag in tags:
+                        buf.append({
+                            "keyword": kw,
+                            "token": clean,
+                            "pos": i,
+                            "saliency_score": float(s),
+                            "treatment": tag,
+                            "is_treatment_token": 1,
+                            "model": args.model,
+                            "frame": frame,
+                        })
+                else:
+                    # Sample ~10% of non-treatment tokens as the "other" baseline
+                    # to keep the CSV size bounded.
+                    if rng.random() < 0.1:
+                        buf.append({
+                            "keyword": kw,
+                            "token": clean,
+                            "pos": i,
+                            "saliency_score": float(s),
+                            "treatment": "OTHER",
+                            "is_treatment_token": 0,
+                            "model": args.model,
+                            "frame": frame,
+                        })
+
+            ckpt.mark(kw)
+            if len(buf) >= 1000:
+                df = pd.DataFrame(buf)
+                df.to_csv(scores_path, mode=("a" if header_written else "w"),
+                          header=not header_written, index=False)
+                header_written = True
+                buf.clear()
+                ckpt.save()
+
+        if buf:
             df = pd.DataFrame(buf)
             df.to_csv(scores_path, mode=("a" if header_written else "w"),
                       header=not header_written, index=False)
             header_written = True
-            buf.clear()
-            ckpt.save()
+        ckpt.save()
 
-    if buf:
-        df = pd.DataFrame(buf)
-        df.to_csv(scores_path, mode=("a" if header_written else "w"),
-                  header=not header_written, index=False)
-        header_written = True
-    ckpt.save()
+        # Build summary: for each treatment, mean saliency over treatment tokens vs others.
+        if scores_path.exists():
+            scores = pd.read_csv(scores_path)
+            treats = [t for t in scores["treatment"].unique() if t != "OTHER"]
+            other_rows = scores[scores["treatment"] == "OTHER"]
+            expanded = [scores[scores["treatment"] != "OTHER"]]
+            for t in treats:
+                clone = other_rows.copy()
+                clone["treatment"] = t
+                expanded.append(clone)
+            scores_for_summary = pd.concat(expanded, ignore_index=True)
+            summary = aggregate_summary(scores_for_summary)
+            summary["frame"] = frame
+            summary.to_csv(summary_path, index=False)
+            print(f"[saliency] frame={frame} summary:")
+            print(summary.to_string(index=False))
 
-    # Build summary: for each treatment, mean saliency over treatment tokens vs others.
-    if scores_path.exists():
-        scores = pd.read_csv(scores_path)
-        # Need both treatment-tagged rows and OTHER rows — broadcast OTHER across
-        # every treatment for the ratio calculation.
-        treats = [t for t in scores["treatment"].unique() if t != "OTHER"]
-        other_rows = scores[scores["treatment"] == "OTHER"]
-        expanded = [scores[scores["treatment"] != "OTHER"]]
-        for t in treats:
-            clone = other_rows.copy()
-            clone["treatment"] = t
-            expanded.append(clone)
-        scores_for_summary = pd.concat(expanded, ignore_index=True)
-        summary = aggregate_summary(scores_for_summary)
-        summary.to_csv(summary_path, index=False)
-        print("[saliency] summary:")
-        print(summary.to_string(index=False))
+        print(f"[saliency] frame={frame} done -> {scores_path}, {summary_path}")
 
-    print(f"[saliency] done -> {scores_path}, {summary_path}")
     return 0
 
 

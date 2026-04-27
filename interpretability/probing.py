@@ -9,6 +9,14 @@ Hypothesis:
   - T5 (topical_comp) peaks later (semantic understanding).
 
 Runtime: ~30-60 min on a modern GPU for N=2000 x 4 treatments.
+
+Frames (--frame): probing has two scientifically interesting modes — `full`
+(is the treatment encoded anywhere) vs `robust_winners` (is it encoded
+specifically among pages the LLM actually picks). `both` (default) runs
+each frame end-to-end and tags every row with a `frame` column so the
+two probing curves can be plotted on shared axes (Figure C).
+Per-frame checkpoints + T7 chunk dirs (suffixed _full / _rw) keep
+resumption isolated across frames.
 """
 
 from __future__ import annotations
@@ -22,6 +30,11 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
+from interpretability._robust_winners import (
+    engine_from_serp_backend,
+    load_robust_winner_pairs,
+    short_model_name,
+)
 from interpretability.utils import (
     Checkpoint,
     HTMLLoader,
@@ -33,6 +46,9 @@ from interpretability.utils import (
     load_serp,
     page_digest,
 )
+
+
+FRAME_SUFFIX = {"full": "_full", "robust_winners": "_rw"}
 
 
 PROBING_TREATMENTS = {
@@ -361,10 +377,15 @@ def main() -> int:
     )
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument(
+        "--frame", choices=("full", "robust_winners", "both"), default="both",
+        help="Sample frame. 'robust_winners' restricts the probing sample to "
+             "(keyword, url) pairs the LLM picks in top-10 under both pools — "
+             "tests whether the treatment is encoded ON pages the model uses, "
+             "not just anywhere. 'both' runs each frame end-to-end and tags "
+             "every row with a `frame` column so the curves share Figure C.",
+    )
     args = ap.parse_args()
-
-    rng = random.Random(args.seed)
-    np_rng = np.random.default_rng(args.seed)
 
     if args.proxy:
         args.model = os.getenv("PROXY_MODEL", "meta-llama/Llama-3.1-8B-Instruct")
@@ -373,7 +394,6 @@ def main() -> int:
     out_dir = Path(args.output_dir)
     (out_dir / "plots").mkdir(parents=True, exist_ok=True)
     out_path = out_dir / "probing_results.csv"
-    ckpt = Checkpoint.load(out_dir / "checkpoint_probing.json")
 
     try:
         import torch
@@ -387,142 +407,184 @@ def main() -> int:
         print("[probing] WARNING: CPU is slow. ETA ~20x slower than GPU.")
 
     print(f"[probing] loading main table from {data_root(args.data_root)}")
-    df = load_main_table(args.data_root)
+    df_full = load_main_table(args.data_root)
 
     default_run = args.run_filter or "searxng_Qwen2.5-72B-Instruct_serp50_top10"
     if default_run not in RUN_IDS:
         print(f"[probing] WARNING: {default_run} not in known RUN_IDS")
 
-    # T7 takes the in-context path (no body-digest sampling needed).
-    digest_treatments = {
-        k: v for k, v in PROBING_TREATMENTS.items() if k != "T7_source_earned"
-    }
-
-    # Build one digest dataset once, reuse across (non-T7) treatments.
-    per_treatment_samples: dict[str, pd.DataFrame] = {}
-    for label, (col, kind) in digest_treatments.items():
-        sub = sample_balanced(df, col, kind, args.sample_n, rng)
-        if sub.empty:
-            print(f"[probing] skip {label} — no variance in {col}")
-            continue
-        per_treatment_samples[label] = sub
-
-    if per_treatment_samples:
-        all_sub = pd.concat(per_treatment_samples.values(), ignore_index=True)
-        all_sub = all_sub.drop_duplicates(subset=["run_id", "url"])
-        digests = build_digest_table(all_sub, data_root(args.data_root), default_run)
-        digest_map = dict(zip(digests["url"], digests["digest"]))
-        print(f"[probing] digests available: {len(digest_map)}")
-    else:
-        digest_map = {}
-
-    # T7 in-context: pick keywords whose SERP candidate pool has both earned
-    # and non-earned URLs, so each prompt yields informative probe examples.
-    t7_prompts: list[tuple[str, str, list[dict]]] = []  # (kw, prompt, spans)
-    if "T7_source_earned" in PROBING_TREATMENTS:
-        serp_df = load_serp(
-            backend=args.t7_serp_backend, pool=args.t7_serp_pool,
-            root=args.data_root,
-        )
-        serp_by_kw = {k: g.sort_values("position").to_dict("records")
-                      for k, g in serp_df.groupby("keyword")}
-        earned_set = {
-            _extract_domain(u)
-            for u in df.loc[df["treat_source_earned"] == 1, "url"].dropna().unique()
-        }
-        print(f"[probing] T7 earned domains: {len(earned_set)}")
-
-        mixed_kws: list[str] = []
-        for kw, results in serp_by_kw.items():
-            top = results[: args.t7_serp_pool]
-            n_earned = sum(
-                1 for r in top if _extract_domain(r["url"]) in earned_set
-            )
-            if 0 < n_earned < len(top):
-                mixed_kws.append(kw)
-        # Deterministic order so resume across restarts hits the same keyword
-        # set even if the chunk dir is partially populated.
-        mixed_kws.sort()
-        rng.shuffle(mixed_kws)
-        chosen = mixed_kws[: args.t7_keywords]
-        print(f"[probing] T7 keywords: {len(chosen)} (out of {len(mixed_kws)} mixed)")
-
-        for kw in chosen:
-            top = serp_by_kw[kw][: args.t7_serp_pool]
-            prompt, spans = build_rerank_prompt_with_spans(kw, top, top_n=10)
-            for s in spans:
-                s["label"] = int(s["domain"] in earned_set)
-            t7_prompts.append((kw, prompt, spans))
+    frames = ["full", "robust_winners"] if args.frame == "both" else [args.frame]
+    pairs = load_robust_winner_pairs() if "robust_winners" in frames else None
+    engine = engine_from_serp_backend(args.t7_serp_backend)
+    short_model = short_model_name(args.model)
 
     model, tok = _load_model(args.model, device)
     if device == "cuda":
         mem = torch.cuda.memory_allocated() / 1e9
         print(f"[probing] GPU memory after load: {mem:.2f} GB")
 
-    all_rows: list[dict] = []
+    for frame in frames:
+        suffix = FRAME_SUFFIX[frame]
+        ckpt = Checkpoint.load(out_dir / f"checkpoint_probing{suffix}.json")
 
-    # T7 first, while VRAM is freshest (full prompts can be ~2k tokens).
-    # Per-keyword chunked extraction: a kill loses at most one keyword.
-    # The probes themselves are trained at the end on the concatenation of
-    # all on-disk chunks, so a clean restart with --resume picks up exactly
-    # where we left off.
-    if t7_prompts and not (args.resume and ckpt.seen("T7_source_earned")):
-        chunk_dir = out_dir / "t7_chunks"
-        mean_X, last_X, y, _meta = t7_in_context_hidden_states(
-            model, tok, t7_prompts, device,
-            max_len=args.t7_max_len, chunk_dir=chunk_dir, ckpt=ckpt,
-        )
-        if len(y) >= 100 and y.sum() >= 10 and (len(y) - y.sum()) >= 10:
-            print(f"[probing] T7 in-context: n={len(y)}  "
-                  f"pos_frac={y.mean():.3f}  hidden={mean_X.shape}")
+        print(f"\n[probing] === frame={frame} ===")
+
+        if frame == "robust_winners":
+            p = pairs[(pairs["search_engine"] == engine)
+                      & (pairs["llm_model"] == short_model)]
+            allowed_pairs = set(zip(p["keyword"], p["url"]))
+            allowed_kws = set(p["keyword"].unique())
+            if not allowed_pairs:
+                print(f"[probing] no robust pairs for {engine}+{short_model}; "
+                      "skipping frame.")
+                continue
+            df = df_full[df_full.apply(
+                lambda r: (r["keyword"], r["url"]) in allowed_pairs, axis=1
+            )].copy()
+            print(f"[probing] robust pairs for {engine}+{short_model}: "
+                  f"{len(allowed_pairs)} pairs over {len(allowed_kws)} keywords; "
+                  f"main_df rows after filter: {len(df)}")
+        else:
+            df = df_full
+            allowed_kws = None
+
+        rng = random.Random(args.seed)
+        np_rng = np.random.default_rng(args.seed)
+
+        # T7 takes the in-context path (no body-digest sampling needed).
+        digest_treatments = {
+            k: v for k, v in PROBING_TREATMENTS.items() if k != "T7_source_earned"
+        }
+
+        per_treatment_samples: dict[str, pd.DataFrame] = {}
+        for label, (col, kind) in digest_treatments.items():
+            sub = sample_balanced(df, col, kind, args.sample_n, rng)
+            if sub.empty:
+                print(f"[probing] skip {label} — no variance in {col}")
+                continue
+            per_treatment_samples[label] = sub
+
+        if per_treatment_samples:
+            all_sub = pd.concat(per_treatment_samples.values(), ignore_index=True)
+            all_sub = all_sub.drop_duplicates(subset=["run_id", "url"])
+            digests = build_digest_table(all_sub, data_root(args.data_root), default_run)
+            digest_map = dict(zip(digests["url"], digests["digest"]))
+            print(f"[probing] digests available: {len(digest_map)}")
+        else:
+            digest_map = {}
+
+        # T7 in-context: pick keywords whose SERP candidate pool has both earned
+        # and non-earned URLs, so each prompt yields informative probe examples.
+        t7_prompts: list[tuple[str, str, list[dict]]] = []
+        if "T7_source_earned" in PROBING_TREATMENTS:
+            serp_df = load_serp(
+                backend=args.t7_serp_backend, pool=args.t7_serp_pool,
+                root=args.data_root,
+            )
+            serp_by_kw = {k: g.sort_values("position").to_dict("records")
+                          for k, g in serp_df.groupby("keyword")}
+            earned_set = {
+                _extract_domain(u)
+                for u in df_full.loc[df_full["treat_source_earned"] == 1, "url"]
+                                .dropna().unique()
+            }
+            print(f"[probing] T7 earned domains: {len(earned_set)}")
+
+            mixed_kws: list[str] = []
+            for kw, results in serp_by_kw.items():
+                if allowed_kws is not None and kw not in allowed_kws:
+                    continue
+                top = results[: args.t7_serp_pool]
+                # In robust mode, only count earned URLs that are robust winners.
+                if frame == "robust_winners":
+                    top = [r for r in top if (kw, r["url"]) in allowed_pairs]
+                    if not top:
+                        continue
+                n_earned = sum(
+                    1 for r in top if _extract_domain(r["url"]) in earned_set
+                )
+                if 0 < n_earned < len(top):
+                    mixed_kws.append(kw)
+            mixed_kws.sort()
+            rng.shuffle(mixed_kws)
+            chosen = mixed_kws[: args.t7_keywords]
+            print(f"[probing] T7 keywords: {len(chosen)} (out of {len(mixed_kws)} mixed)")
+
+            for kw in chosen:
+                top = serp_by_kw[kw][: args.t7_serp_pool]
+                if frame == "robust_winners":
+                    top = [r for r in top if (kw, r["url"]) in allowed_pairs]
+                prompt, spans = build_rerank_prompt_with_spans(kw, top, top_n=10)
+                for s in spans:
+                    s["label"] = int(s["domain"] in earned_set)
+                t7_prompts.append((kw, prompt, spans))
+
+        all_rows: list[dict] = []
+
+        # T7 first, while VRAM is freshest (full prompts can be ~2k tokens).
+        # Per-keyword chunked extraction: a kill loses at most one keyword.
+        if t7_prompts and not (args.resume and ckpt.seen("T7_source_earned")):
+            chunk_dir = out_dir / f"t7_chunks{suffix}"
+            mean_X, last_X, y, _meta = t7_in_context_hidden_states(
+                model, tok, t7_prompts, device,
+                max_len=args.t7_max_len, chunk_dir=chunk_dir, ckpt=ckpt,
+            )
+            if len(y) >= 100 and y.sum() >= 10 and (len(y) - y.sum()) >= 10:
+                print(f"[probing] T7 in-context: n={len(y)}  "
+                      f"pos_frac={y.mean():.3f}  hidden={mean_X.shape}")
+                rows = []
+                rows += train_probes(last_X, y, "last_token", "T7_source_earned", np_rng)
+                rows += train_probes(mean_X, y, "mean", "T7_source_earned", np_rng)
+                for r in rows:
+                    r["frame"] = frame
+                all_rows.extend(rows)
+                mode = "a" if out_path.exists() else "w"
+                pd.DataFrame(rows).to_csv(
+                    out_path, mode=mode, header=(mode == "w"), index=False
+                )
+                ckpt.mark("T7_source_earned")
+                ckpt.save()
+            else:
+                print(f"[probing] T7 in-context: insufficient data (n={len(y)}, "
+                      f"pos={int(y.sum())}); skipping")
+
+        for label, sub in per_treatment_samples.items():
+            if args.resume and ckpt.seen(label):
+                print(f"[probing] skipping {label} (already in {frame} checkpoint)")
+                continue
+
+            sub = sub[sub["url"].isin(digest_map)]
+            if len(sub) < 100:
+                print(f"[probing] {label}: only {len(sub)} rows with digests, skipping")
+                continue
+
+            texts = [digest_map[u] for u in sub["url"]]
+            y = sub["label"].astype(int).to_numpy()
+            print(f"[probing] {label}: n={len(y)}  pos_frac={y.mean():.2f}")
+
+            last_X, mean_X = hidden_states_for_texts(
+                model, tok, texts, device,
+                max_len=args.max_len, batch_size=args.batch_size,
+            )
+            print(f"[probing] {label}: hidden-states shape last={last_X.shape}  mean={mean_X.shape}")
+
             rows = []
-            rows += train_probes(last_X, y, "last_token", "T7_source_earned", np_rng)
-            rows += train_probes(mean_X, y, "mean", "T7_source_earned", np_rng)
+            rows += train_probes(last_X, y, "last_token", label, np_rng)
+            rows += train_probes(mean_X, y, "mean", label, np_rng)
+            for r in rows:
+                r["frame"] = frame
             all_rows.extend(rows)
+
             mode = "a" if out_path.exists() else "w"
             pd.DataFrame(rows).to_csv(
                 out_path, mode=mode, header=(mode == "w"), index=False
             )
-            ckpt.mark("T7_source_earned")
+            ckpt.mark(label)
             ckpt.save()
-        else:
-            print(f"[probing] T7 in-context: insufficient data (n={len(y)}, "
-                  f"pos={int(y.sum())}); skipping")
 
-    for label, sub in per_treatment_samples.items():
-        if args.resume and ckpt.seen(label):
-            print(f"[probing] skipping {label} (already in checkpoint)")
-            continue
+        print(f"[probing] frame={frame} done")
 
-        sub = sub[sub["url"].isin(digest_map)]
-        if len(sub) < 100:
-            print(f"[probing] {label}: only {len(sub)} rows with digests, skipping")
-            continue
-
-        texts = [digest_map[u] for u in sub["url"]]
-        y = sub["label"].astype(int).to_numpy()
-        print(f"[probing] {label}: n={len(y)}  pos_frac={y.mean():.2f}")
-
-        last_X, mean_X = hidden_states_for_texts(
-            model, tok, texts, device,
-            max_len=args.max_len, batch_size=args.batch_size,
-        )
-        print(f"[probing] {label}: hidden-states shape last={last_X.shape}  mean={mean_X.shape}")
-
-        rows = []
-        rows += train_probes(last_X, y, "last_token", label, np_rng)
-        rows += train_probes(mean_X, y, "mean", label, np_rng)
-        all_rows.extend(rows)
-
-        # Incremental write so a crash doesn't lose earlier treatments.
-        mode = "a" if out_path.exists() else "w"
-        pd.DataFrame(rows).to_csv(
-            out_path, mode=mode, header=(mode == "w"), index=False
-        )
-        ckpt.mark(label)
-        ckpt.save()
-
-    print(f"[probing] done -> {out_path}")
+    print(f"[probing] all frames done -> {out_path}")
     return 0
 
 

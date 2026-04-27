@@ -6,6 +6,12 @@ measuring the ranking impact.
 
 Runtime: ~2-4 h for N=500 keywords x 5 treatments x 2 models on the HF
 Inference API. Resumable via --resume.
+
+Frames (--frame): `full` runs over all keywords as before; `robust_winners`
+restricts the candidate pool to (keyword, url) pairs the LLM placed in
+top-10 under both serp20 and serp50 — same conditioning as the §4.1 DML
+headline coefficients in `docs/robust-winners-analysis-2026-04-26.md`.
+`both` (default) runs each frame end-to-end and writes side-by-side outputs.
 """
 
 from __future__ import annotations
@@ -19,6 +25,12 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
+from interpretability._robust_winners import (
+    engine_from_serp_backend,
+    filter_to_robust,
+    load_robust_winner_pairs,
+    short_model_name,
+)
 from interpretability.utils import (
     ABLATION_RULES,
     Checkpoint,
@@ -33,6 +45,9 @@ from interpretability.utils import (
     make_ranker,
     parse_ranked_domains,
 )
+
+
+FRAME_SUFFIX = {"full": "_full", "robust_winners": "_rw"}
 
 
 TREATMENTS_TO_ABLATE = [
@@ -164,23 +179,13 @@ def main() -> int:
     )
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--seed", type=int, default=42)
-    args = ap.parse_args()
-
-    rng = random.Random(args.seed)
-    np.random.seed(args.seed)
-
-    out_dir = Path(args.output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    results_path = out_dir / "ablation_results.csv"
-    ckpt = Checkpoint.load(out_dir / "checkpoint_ablation.json")
-
-    print(f"[ablation] loading main table from {data_root(args.data_root)}")
-    main_df = load_main_table(args.data_root)
-    serp_df = load_serp(
-        backend=args.serp_backend, pool=args.serp_pool, root=args.data_root
+    ap.add_argument(
+        "--frame", choices=("full", "robust_winners", "both"), default="both",
+        help="Sample frame. 'robust_winners' restricts to (keyword, url) pairs "
+             "the LLM picked in top-10 under both serp20 and serp50 — matches "
+             "the §4.1 DML coefficients. 'both' runs each frame end-to-end.",
     )
-    serp_by_kw = {k: g.sort_values("position").to_dict("records")
-                  for k, g in serp_df.groupby("keyword")}
+    args = ap.parse_args()
 
     if args.models is None:
         if args.backend == "api":
@@ -200,79 +205,126 @@ def main() -> int:
     print(f"[ablation] backend={args.backend} models={models}")
     rankers = {m: make_ranker(args.backend, m) for m in models}
 
-    # Idempotent resume: if CSV exists, skip (keyword, treatment, model) already done.
-    done_keys: set[tuple[str, str, str]] = set()
-    if args.resume and results_path.exists():
-        prev = pd.read_csv(results_path)
-        done_keys = set(zip(prev["keyword"], prev["treatment"], prev["model"]))
-        print(f"[ablation] resuming: {len(done_keys)} rows already present")
+    print(f"[ablation] loading main table from {data_root(args.data_root)}")
+    main_df = load_main_table(args.data_root)
+    serp_df = load_serp(
+        backend=args.serp_backend, pool=args.serp_pool, root=args.data_root
+    )
+    serp_by_kw_full = {k: g.sort_values("position").to_dict("records")
+                       for k, g in serp_df.groupby("keyword")}
 
-    # For each treatment, stratified keyword sample.
-    all_rows: list[dict] = []
-    for treatment in treatments:
-        kws = stratified_keyword_sample(main_df, treatment, args.sample_n, rng)
-        if not kws:
-            print(f"[ablation] no keywords for {treatment}, skipping")
-            continue
-        print(f"[ablation] treatment={treatment}  n_keywords={len(kws)}")
-        for kw in tqdm(kws, desc=treatment):
-            cand = serp_by_kw.get(kw)
-            if not cand:
+    frames = ["full", "robust_winners"] if args.frame == "both" else [args.frame]
+    pairs = load_robust_winner_pairs() if "robust_winners" in frames else None
+    engine = engine_from_serp_backend(args.serp_backend)
+
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    for frame in frames:
+        suffix = FRAME_SUFFIX[frame]
+        results_path = out_dir / f"ablation_results{suffix}.csv"
+        ckpt = Checkpoint.load(out_dir / f"checkpoint_ablation{suffix}.json")
+
+        print(f"\n[ablation] === frame={frame} -> {results_path.name} ===")
+
+        # Per-frame restriction. For robust_winners we keep only (keyword, url)
+        # pairs that are robust for THIS engine and ANY of the requested models;
+        # earned/topical lookups still need the full main_df slice for that kw.
+        if frame == "robust_winners":
+            short_models = {short_model_name(m) for m in models}
+            p = pairs[(pairs["search_engine"] == engine)
+                      & (pairs["llm_model"].isin(short_models))]
+            allowed_pairs = set(zip(p["keyword"], p["url"]))
+            allowed_kws = set(p["keyword"].unique())
+            print(f"[ablation] robust pairs for engine={engine} "
+                  f"models={sorted(short_models)}: "
+                  f"{len(allowed_pairs)} pairs over {len(allowed_kws)} keywords")
+            main_df_frame = main_df[main_df["keyword"].isin(allowed_kws)]
+            serp_by_kw = {
+                kw: [r for r in cand if (kw, r["url"]) in allowed_pairs]
+                for kw, cand in serp_by_kw_full.items()
+                if kw in allowed_kws
+            }
+            serp_by_kw = {kw: cand for kw, cand in serp_by_kw.items() if cand}
+        else:
+            main_df_frame = main_df
+            serp_by_kw = serp_by_kw_full
+
+        # Idempotent resume: if CSV exists, skip (keyword, treatment, model) already done.
+        done_keys: set[tuple[str, str, str]] = set()
+        if args.resume and results_path.exists():
+            prev = pd.read_csv(results_path)
+            done_keys = set(zip(prev["keyword"], prev["treatment"], prev["model"]))
+            print(f"[ablation] resuming: {len(done_keys)} rows already present")
+
+        all_rows: list[dict] = []
+        rng = random.Random(args.seed)  # reset per-frame so kw sample is reproducible
+        for treatment in treatments:
+            kws = stratified_keyword_sample(main_df_frame, treatment, args.sample_n, rng)
+            if not kws:
+                print(f"[ablation] no keywords for {treatment}, skipping")
                 continue
-            cand = cand[: max(args.serp_pool, 20)]
-            kw_rows = main_df[main_df.keyword == kw]
-
-            ablated = ablate_results_for_treatment(cand, treatment, kw_rows)
-
-            for model in models:
-                key = (kw, treatment, model)
-                if key in done_keys or ckpt.seen("|".join(key)):
+            print(f"[ablation] treatment={treatment}  n_keywords={len(kws)}")
+            for kw in tqdm(kws, desc=f"{frame}:{treatment}"):
+                cand = serp_by_kw.get(kw)
+                if not cand:
                     continue
+                cand = cand[: max(args.serp_pool, 20)]
+                kw_rows = main_df_frame[main_df_frame.keyword == kw]
 
-                try:
-                    base_out = rankers[model].rank(
-                        build_rerank_prompt(kw, cand, top_n=args.top_n)
-                    )
-                    abl_out = rankers[model].rank(
-                        build_rerank_prompt(kw, ablated, top_n=args.top_n)
-                    )
-                except Exception as e:
-                    print(f"[ablation] API error for ({kw},{treatment},{model}): {e}")
-                    continue
+                ablated = ablate_results_for_treatment(cand, treatment, kw_rows)
 
-                base_ranks = rank_positions(parse_ranked_domains(base_out), cand)
-                abl_ranks = rank_positions(parse_ranked_domains(abl_out), ablated)
-
-                for c in cand:
-                    url = c["url"]
-                    b = base_ranks.get(url)
-                    a = abl_ranks.get(url)
-                    if b is None and a is None:
+                for model in models:
+                    key = (kw, treatment, model)
+                    if key in done_keys or ckpt.seen("|".join(key)):
                         continue
-                    all_rows.append({
-                        "keyword": kw,
-                        "url": url,
-                        "domain": _extract_domain(url),
-                        "treatment": treatment,
-                        "model": model,
-                        "baseline_rank": b,
-                        "ablated_rank": a,
-                        # Positive = ablation demoted page = feature was promoting it.
-                        "ablation_delta": (
-                            (b if b is not None else args.top_n + 1)
-                            - (a if a is not None else args.top_n + 1)
-                        ) * -1,
-                    })
 
-                ckpt.mark("|".join(key))
-                if len(all_rows) % 10 == 0:
-                    _flush(all_rows, results_path, append=results_path.exists())
-                    all_rows = []
-                    ckpt.save()
+                    try:
+                        base_out = rankers[model].rank(
+                            build_rerank_prompt(kw, cand, top_n=args.top_n)
+                        )
+                        abl_out = rankers[model].rank(
+                            build_rerank_prompt(kw, ablated, top_n=args.top_n)
+                        )
+                    except Exception as e:
+                        print(f"[ablation] API error for ({kw},{treatment},{model}): {e}")
+                        continue
 
-    _flush(all_rows, results_path, append=results_path.exists())
-    ckpt.save()
-    print(f"[ablation] done -> {results_path}")
+                    base_ranks = rank_positions(parse_ranked_domains(base_out), cand)
+                    abl_ranks = rank_positions(parse_ranked_domains(abl_out), ablated)
+
+                    for c in cand:
+                        url = c["url"]
+                        b = base_ranks.get(url)
+                        a = abl_ranks.get(url)
+                        if b is None and a is None:
+                            continue
+                        all_rows.append({
+                            "keyword": kw,
+                            "url": url,
+                            "domain": _extract_domain(url),
+                            "treatment": treatment,
+                            "model": model,
+                            "frame": frame,
+                            "baseline_rank": b,
+                            "ablated_rank": a,
+                            # Positive = ablation demoted page = feature was promoting it.
+                            "ablation_delta": (
+                                (b if b is not None else args.top_n + 1)
+                                - (a if a is not None else args.top_n + 1)
+                            ) * -1,
+                        })
+
+                    ckpt.mark("|".join(key))
+                    if len(all_rows) % 10 == 0:
+                        _flush(all_rows, results_path, append=results_path.exists())
+                        all_rows = []
+                        ckpt.save()
+
+        _flush(all_rows, results_path, append=results_path.exists())
+        ckpt.save()
+        print(f"[ablation] frame={frame} done -> {results_path}")
+
     return 0
 
 
