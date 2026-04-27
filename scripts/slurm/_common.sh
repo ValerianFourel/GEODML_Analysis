@@ -66,7 +66,10 @@ nvidia-smi -L 2>&1 | sed 's/^/[common]   /' || echo "[common] nvidia-smi unavail
 # as $2..$N. Caller decides whether to call this (typically only on rc != 0).
 chain_resubmit() {
   local script="$1"; shift
-  local extra="$*"
+  local extra=""
+  for kv in "$@"; do
+    extra="${extra:+$extra,}$kv"
+  done
   local attempt="${ATTEMPT:-1}"
   local max="${MAX_ATTEMPTS:-6}"
   if [ "$attempt" -ge "$max" ]; then
@@ -75,9 +78,8 @@ chain_resubmit() {
   fi
   local next=$((attempt + 1))
   echo "[chain] queueing attempt $next/$max with --dependency=afterany:$SLURM_JOB_ID"
-  # shellcheck disable=SC2086
   sbatch \
     --dependency=afterany:"$SLURM_JOB_ID" \
-    --export=ALL,ATTEMPT="$next",MAX_ATTEMPTS="$max"${extra:+,$extra} \
+    --export="ALL,ATTEMPT=$next,MAX_ATTEMPTS=$max${extra:+,$extra}" \
     "$script"
 }

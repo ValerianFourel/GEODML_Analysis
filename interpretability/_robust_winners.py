@@ -22,6 +22,7 @@ is rederived from the local main parquet (or HF dataset as fallback).
 from __future__ import annotations
 
 import datetime as _dt
+import os
 import re
 from pathlib import Path
 
