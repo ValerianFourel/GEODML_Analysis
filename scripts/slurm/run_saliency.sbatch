@@ -17,7 +17,7 @@
 #SBATCH --job-name=geodml-sal
 #SBATCH --output=logs/%x-%j.out
 #SBATCH --error=logs/%x-%j.err
-#SBATCH --requeue
+# JSC's submit filter blocks #SBATCH --requeue (see run_ablation.sbatch).
 
 # shellcheck source=scripts/slurm/_common.sh
 source "$SLURM_SUBMIT_DIR/scripts/slurm/_common.sh"

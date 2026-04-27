@@ -20,7 +20,9 @@
 #SBATCH --job-name=geodml-abl
 #SBATCH --output=logs/%x-%j.out
 #SBATCH --error=logs/%x-%j.err
-#SBATCH --requeue
+# Note: JSC's submit filter blocks #SBATCH --requeue. Node-failure recovery
+# isn't automatic — re-run dispatch_all.sh if a node dies. Walltime / transient
+# errors are still handled by the chain_resubmit chain at the bottom.
 
 # shellcheck source=scripts/slurm/_common.sh
 source "$SLURM_SUBMIT_DIR/scripts/slurm/_common.sh"
