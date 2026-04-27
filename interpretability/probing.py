@@ -44,6 +44,8 @@ from interpretability.utils import (
     data_root,
     load_main_table,
     load_serp,
+    log_device_map,
+    multi_gpu_load_kwargs,
     page_digest,
 )
 
@@ -82,29 +84,21 @@ def sample_balanced(
 
 
 def _load_model(model_name: str, device: str):
-    import torch
-    from transformers import AutoModel, AutoTokenizer, BitsAndBytesConfig
+    from transformers import AutoModel, AutoTokenizer
 
     tok = AutoTokenizer.from_pretrained(model_name, use_fast=True)
     if tok.pad_token_id is None:
         tok.pad_token = tok.eos_token
 
-    kw: dict = {"device_map": "auto", "output_hidden_states": True}
-    if device == "cuda":
-        try:
-            kw["quantization_config"] = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_compute_dtype=torch.bfloat16,
-                bnb_4bit_quant_type="nf4",
-                bnb_4bit_use_double_quant=True,
-            )
-        except Exception:
-            kw["torch_dtype"] = torch.float16
-    else:
-        kw = {"output_hidden_states": True, "torch_dtype": torch.float32}
-
+    # Probing is forward-only, so a smaller reserve is fine.
+    kw = multi_gpu_load_kwargs(
+        quantize=(device == "cuda"),
+        reserve_gib_per_gpu=6.0,
+        output_hidden_states=True,
+    )
     model = AutoModel.from_pretrained(model_name, **kw)
     model.eval()
+    log_device_map(model, prefix="[probing]")
     return model, tok
 
 

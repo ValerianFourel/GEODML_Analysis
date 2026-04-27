@@ -293,6 +293,93 @@ def parse_ranked_domains(llm_output: str) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Multi-GPU sharding helpers (Jülich booster: --gres=gpu:4 on H100/A100)
+# ---------------------------------------------------------------------------
+
+def multi_gpu_load_kwargs(
+    quantize: bool = True,
+    reserve_gib_per_gpu: float = 8.0,
+    cpu_offload_gib: int = 64,
+    output_hidden_states: bool = False,
+) -> dict:
+    """Build `from_pretrained` kwargs that shard a model across visible GPUs.
+
+    Sets `device_map="auto"` plus a `max_memory` budget that reserves
+    `reserve_gib_per_gpu` on each device for activations / KV cache / grads.
+    On 4-GPU SLURM jobs (`--gres=gpu:4`), this forces accelerate to spread a
+    70B-bf16 (~140 GB) or a saliency forward+backward across multiple cards
+    instead of OOMing on cuda:0.
+
+    Single-GPU and CPU paths are unchanged.
+    """
+    import torch
+
+    kw: dict = {}
+    if output_hidden_states:
+        kw["output_hidden_states"] = True
+
+    if not torch.cuda.is_available():
+        kw["torch_dtype"] = torch.float32
+        return kw
+
+    n_gpus = torch.cuda.device_count()
+    kw["device_map"] = "auto"
+
+    if n_gpus > 1:
+        budgets: dict = {}
+        for i in range(n_gpus):
+            total_gib = torch.cuda.get_device_properties(i).total_memory / (1024**3)
+            usable = max(int(total_gib - reserve_gib_per_gpu), 1)
+            budgets[i] = f"{usable}GiB"
+        budgets["cpu"] = f"{cpu_offload_gib}GiB"
+        kw["max_memory"] = budgets
+        print(
+            f"[load] CUDA_VISIBLE_DEVICES gives {n_gpus} GPUs; "
+            f"max_memory={ {k: v for k, v in budgets.items() if k != 'cpu'} } "
+            f"(reserved {reserve_gib_per_gpu:.0f} GiB/GPU for activations/grads)"
+        )
+
+    if quantize:
+        try:
+            from transformers import BitsAndBytesConfig
+            kw["quantization_config"] = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=torch.bfloat16,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_use_double_quant=True,
+            )
+        except Exception as e:
+            print(f"[load] bitsandbytes unavailable ({e}); falling back to fp16")
+            kw["torch_dtype"] = torch.float16
+    return kw
+
+
+def log_device_map(model, prefix: str = "[load]") -> None:
+    """Compact SLURM-log-friendly print of how the model was sharded."""
+    dm = getattr(model, "hf_device_map", None)
+    if not dm:
+        try:
+            dev = next(model.parameters()).device
+        except StopIteration:
+            dev = "?"
+        print(f"{prefix} single-device load: {dev}")
+        return
+    counts: dict = {}
+    for _, dev in dm.items():
+        key = str(dev)
+        counts[key] = counts.get(key, 0) + 1
+    summary = ", ".join(f"{k}:{v}" for k, v in sorted(counts.items()))
+    print(f"{prefix} hf_device_map: {len(dm)} modules over {len(counts)} devices [{summary}]")
+    try:
+        import torch
+        for i in range(torch.cuda.device_count()):
+            mem = torch.cuda.memory_allocated(i) / (1024**3)
+            print(f"{prefix}   cuda:{i} allocated={mem:.2f} GiB")
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
 # Ranker backends (API for online, Local for offline HPC clusters)
 # ---------------------------------------------------------------------------
 
@@ -341,26 +428,12 @@ class LocalRanker:
         if self.tok.pad_token_id is None:
             self.tok.pad_token = self.tok.eos_token
 
-        cuda = torch.cuda.is_available()
-        kw: dict = {}
-        if cuda:
-            kw["device_map"] = "auto"
-            if quantize:
-                try:
-                    from transformers import BitsAndBytesConfig
-                    kw["quantization_config"] = BitsAndBytesConfig(
-                        load_in_4bit=True,
-                        bnb_4bit_compute_dtype=torch.bfloat16,
-                        bnb_4bit_quant_type="nf4",
-                        bnb_4bit_use_double_quant=True,
-                    )
-                except Exception as e:
-                    print(f"[LocalRanker] bitsandbytes unavailable ({e}); fp16 instead")
-                    kw["torch_dtype"] = torch.float16
-        else:
+        kw = multi_gpu_load_kwargs(quantize=quantize)
+        if not torch.cuda.is_available():
             kw["torch_dtype"] = getattr(torch, dtype, torch.float32)
         self.model = AutoModelForCausalLM.from_pretrained(model, **kw)
         self.model.eval()
+        log_device_map(self.model, prefix="[LocalRanker]")
         self.device = next(self.model.parameters()).device
         self._has_chat_template = bool(getattr(self.tok, "chat_template", None))
 

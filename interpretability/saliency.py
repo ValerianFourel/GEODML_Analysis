@@ -40,6 +40,8 @@ from interpretability.utils import (
     data_root,
     load_main_table,
     load_serp,
+    log_device_map,
+    multi_gpu_load_kwargs,
     tag_token_for_treatment,
 )
 
@@ -48,29 +50,18 @@ FRAME_SUFFIX = {"full": "_full", "robust_winners": "_rw"}
 
 
 def _load_model(model_name: str, device: str):
-    import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+    from transformers import AutoModelForCausalLM, AutoTokenizer
 
     tok = AutoTokenizer.from_pretrained(model_name, use_fast=True)
     if tok.pad_token_id is None:
         tok.pad_token = tok.eos_token
 
-    kw: dict = {"device_map": "auto"} if device == "cuda" else {"torch_dtype": torch.float32}
-    if device == "cuda":
-        try:
-            quant = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_compute_dtype=torch.bfloat16,
-                bnb_4bit_quant_type="nf4",
-                bnb_4bit_use_double_quant=True,
-            )
-            kw["quantization_config"] = quant
-        except Exception as e:
-            print(f"[saliency] bitsandbytes unavailable ({e}); falling back to fp16")
-            kw["torch_dtype"] = torch.float16
-
+    # Saliency runs a backward pass, so reserve more headroom per GPU
+    # (activations + grad copies double effective memory at peak).
+    kw = multi_gpu_load_kwargs(quantize=(device == "cuda"), reserve_gib_per_gpu=12.0)
     model = AutoModelForCausalLM.from_pretrained(model_name, **kw)
     model.eval()
+    log_device_map(model, prefix="[saliency]")
     return model, tok
 
 
