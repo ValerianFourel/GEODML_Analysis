@@ -160,6 +160,19 @@ class StageDInfo:
 
 
 @dataclass
+class OrderProbeRow:
+    model: str
+    engine: str
+    pool: int
+    variant: str
+    seed: int
+    run_id: str
+    jsonl_path: str
+    keywords: int
+    size: int
+
+
+@dataclass
 class Snapshot:
     timestamp: str
     data_root: str
@@ -171,6 +184,8 @@ class Snapshot:
     stage_b: list[StageBRow]
     stage_c: list[StageCInfo]
     stage_d: list[StageDInfo]
+    order_probe: list[OrderProbeRow]
+    order_probe_summary: dict[str, Any]
 
 
 # ── Collectors ───────────────────────────────────────────────────────────────
@@ -355,7 +370,66 @@ def collect_stage_d(data_root: Path, variants: list[str]) -> list[StageDInfo]:
     return out
 
 
-def collect_snapshot(data_root: Path, variants: list[str]) -> Snapshot:
+def collect_order_probe(data_root: Path, variants: list[str],
+                        seeds: list[int]) -> list[OrderProbeRow]:
+    rows: list[OrderProbeRow] = []
+    for variant in variants:
+        for model_id in C.LLM_MODELS:
+            model_short = C.short_model_name(model_id)
+            for engine in C.ENGINES:
+                for serp_n, top_n in C.POOL_SIZES:
+                    run_id = C.run_label_with_variant(
+                        engine, model_id, serp_n, top_n, variant,
+                    )
+                    for seed in seeds:
+                        p = data_root / "data" / "order_probe" / f"{run_id}_seed{seed}.jsonl"
+                        rows.append(OrderProbeRow(
+                            model=model_short,
+                            engine=engine,
+                            pool=serp_n,
+                            variant=variant,
+                            seed=seed,
+                            run_id=run_id,
+                            jsonl_path=str(p),
+                            keywords=jsonl_rows(p),
+                            size=p.stat().st_size if p.exists() else 0,
+                        ))
+    return rows
+
+
+def collect_order_probe_summary(data_root: Path) -> dict[str, Any]:
+    """Tiny headline read of order_probe_summary.parquet if present."""
+    p = data_root / "data" / "order_probe" / "order_probe_summary.parquet"
+    if not p.exists():
+        return {"path": str(p), "exists": False, "rows": 0}
+    m = parquet_meta(p)
+    out: dict[str, Any] = {
+        "path": str(p), "exists": True,
+        "rows": m["rows"], "size": m["size"],
+        "headline": [],
+    }
+    if m["rows"] <= 0:
+        return out
+    try:
+        import pandas as pd
+        df = pd.read_parquet(p)
+        if "K" in df.columns:
+            sub = df[df.K == 10]
+            head = (sub.groupby(["variant", "ordering_pair"])
+                       .agg(mean_jacc=("jaccard", "mean"),
+                            mean_oak=("overlap_at_k", "mean"),
+                            n=("keyword", "count"))
+                       .reset_index()
+                       .round(3))
+            out["headline"] = head.to_dict("records")
+    except Exception as e:
+        out["error"] = str(e)
+    return out
+
+
+def collect_snapshot(data_root: Path, variants: list[str],
+                     seeds: list[int] | None = None) -> Snapshot:
+    seeds = seeds if seeds is not None else [42, 123]
     return Snapshot(
         timestamp=dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         data_root=str(data_root),
@@ -367,6 +441,8 @@ def collect_snapshot(data_root: Path, variants: list[str]) -> Snapshot:
         stage_b=collect_stage_b(data_root),
         stage_c=collect_stage_c(data_root, variants),
         stage_d=collect_stage_d(data_root, variants),
+        order_probe=collect_order_probe(data_root, variants, seeds),
+        order_probe_summary=collect_order_probe_summary(data_root),
     )
 
 
@@ -474,6 +550,66 @@ def print_stage_d(rows: list[StageDInfo]) -> None:
         if r.rows > 0:
             print(f"        treatments={len(r.treatments):<2d}  methods={r.methods}  "
                   f"learners={r.learners}  subsets={len(r.subsets)}")
+
+
+def print_order_probe(rows: list[OrderProbeRow], variants: list[str],
+                       seeds: list[int]) -> None:
+    n_cells = len(C.LLM_MODELS) * len(C.ENGINES) * len(C.POOL_SIZES)
+    total = n_cells * len(variants) * len(seeds)
+    header(f"Stage A' — order probe   ({n_cells} cells × {len(variants)} variant(s) × "
+           f"{len(seeds)} seeds = {total} jsonl files)")
+    print(f"  {'model':<22s}  {'engine':<8s}  {'pool':<5s}  {'variant':<8s}  ", end="")
+    for s in seeds:
+        print(f"  seed={s:<5d}", end="")
+    print()
+    print(f"  {'-'*22}  {'-'*8}  {'-'*5}  {'-'*8}  ", end="")
+    for _ in seeds:
+        print(f"  {'-'*10}", end="")
+    print()
+
+    by_key: dict[tuple[str, str, int, str, int], OrderProbeRow] = {
+        (r.model, r.engine, r.pool, r.variant, r.seed): r for r in rows
+    }
+    for variant in variants:
+        for model_id in C.LLM_MODELS:
+            m = C.short_model_name(model_id)
+            for engine in C.ENGINES:
+                for serp_n, _ in C.POOL_SIZES:
+                    print(f"  {m[:22]:<22s}  {engine:<8s}  {serp_n:<5d}  "
+                          f"{variant:<8s}  ", end="")
+                    for s in seeds:
+                        r = by_key.get((m, engine, serp_n, variant, s))
+                        if r is None or r.keywords == 0:
+                            print(f"  {col(' - ', DIM):<10s}", end="")
+                        else:
+                            tag = _ok(r.keywords, expected_min=10)
+                            print(f"  {tag} {r.keywords:>5d}", end="")
+                    print()
+    n_done = sum(1 for r in rows if r.keywords > 0)
+    kw_total = sum(r.keywords for r in rows)
+    print(f"  cells with output: {n_done}/{total}  total keyword-records: {kw_total}")
+
+
+def print_order_probe_summary(summary: dict[str, Any]) -> None:
+    header("Stage A' — order probe analysis (order_probe_summary.parquet)")
+    if not summary.get("exists"):
+        print(col("  not yet generated. After all 32 jobs finish, run:", DIM))
+        print(col("    python -m interpretability.pipeline.order_probe_analyze", DIM))
+        return
+    rows = summary.get("rows", 0)
+    if rows <= 0:
+        print(col(f"  empty parquet at {Path(summary['path']).name} — analyze produced no rows.", YELLOW))
+        return
+    print(f"  {col('rows:', DIM)} {rows}    "
+          f"{col('K=10 headline (mean overlap by variant × ordering_pair):', DIM)}")
+    head = summary.get("headline", [])
+    if not head:
+        print(col("  (headline missing — parquet probably has unexpected columns)", YELLOW))
+        return
+    print(f"  {'variant':<8s}  {'ordering_pair':<28s}  {'mean_jacc':>9s}  {'mean_oak':>9s}  {'n':>6s}")
+    for r in sorted(head, key=lambda x: (x["variant"], x["ordering_pair"])):
+        print(f"  {r['variant']:<8s}  {r['ordering_pair']:<28s}  "
+              f"{r['mean_jacc']:>9.3f}  {r['mean_oak']:>9.3f}  {r['n']:>6d}")
 
 
 def print_headline(stage_d: list[StageDInfo]) -> None:
@@ -594,6 +730,23 @@ def compare_snapshots(before: dict, after: dict) -> None:
         if not any_change:
             print(col("  no change", DIM))
 
+    # Order probe
+    header("Stage A' — order probe changes")
+    bmap4 = {(r["model"], r["engine"], r["pool"], r["variant"], r["seed"]): r
+             for r in before.get("order_probe", [])}
+    amap4 = {(r["model"], r["engine"], r["pool"], r["variant"], r["seed"]): r
+             for r in after.get("order_probe", [])}
+    any_change = False
+    for k in sorted(set(bmap4) | set(amap4)):
+        b = bmap4.get(k, {"keywords": 0})
+        a = amap4.get(k, {"keywords": 0})
+        if b["keywords"] != a["keywords"]:
+            any_change = True
+            print(f"  {k[3]:<8s}  {k[0][:22]:<22s} {k[1]:<8s} pool={k[2]:<3d} "
+                  f"seed={k[4]:<4d}  keywords {_diff_count(b['keywords'], a['keywords'])}")
+    if not any_change:
+        print(col("  no change", DIM))
+
     # Headline coefficient diffs (Stage D only)
     header("Stage D — POOLED+plr+lgbm+rank_delta coefficient changes")
     def hmap(snap: dict) -> dict[tuple[str, str], dict[str, Any]]:
@@ -631,6 +784,8 @@ def main() -> int:
     ap.add_argument("--variant", choices=("biased", "neutral", "both"),
                     default="both",
                     help="Which prompt variant to audit (default: both).")
+    ap.add_argument("--seeds", nargs="+", type=int, default=[42, 123],
+                    help="Order-probe seeds to audit (default: 42 123).")
     ap.add_argument("--data-root", default=None,
                     help="Override $GEODML_DATA_ROOT.")
     ap.add_argument("--save", default=None, metavar="FILE.json",
@@ -652,7 +807,7 @@ def main() -> int:
     data_root = Path(args.data_root) if args.data_root else C.DEFAULT_DATA_ROOT
     variants = ["biased", "neutral"] if args.variant == "both" else [args.variant]
 
-    snap = collect_snapshot(data_root, variants)
+    snap = collect_snapshot(data_root, variants, seeds=args.seeds)
 
     if args.save:
         out_path = Path(args.save)
@@ -673,6 +828,10 @@ def main() -> int:
     print_stage_c(snap.stage_c)
     print_stage_d(snap.stage_d)
     print_headline(snap.stage_d)
+    seeds_used = sorted({r.seed for r in snap.order_probe})
+    if seeds_used:
+        print_order_probe(snap.order_probe, variants, seeds_used)
+        print_order_probe_summary(snap.order_probe_summary)
 
     # Final summary line
     sa_done = sum(1 for r in snap.stage_a if r.keywords > 0)
@@ -683,12 +842,15 @@ def main() -> int:
     sc_total = len(snap.stage_c)
     sd_done = sum(1 for r in snap.stage_d if r.rows > 0)
     sd_total = len(snap.stage_d)
+    op_done = sum(1 for r in snap.order_probe if r.keywords > 0)
+    op_total = len(snap.order_probe)
 
     header("Summary")
     print(f"  Stage A   {sa_done:>2d}/{sa_total:<2d}   "
           f"Stage B  {sb_done:>2d}/{sb_total:<2d}   "
           f"Stage C  {sc_done:>2d}/{sc_total:<2d}   "
-          f"Stage D  {sd_done:>2d}/{sd_total:<2d}")
+          f"Stage D  {sd_done:>2d}/{sd_total:<2d}   "
+          f"Order probe  {op_done:>2d}/{op_total:<2d}")
     return 0
 
 

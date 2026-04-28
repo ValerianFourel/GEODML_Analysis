@@ -50,6 +50,8 @@ TREATMENTS=(
 FRAMES=(full robust_winners)
 ENGINES=(searxng ddg)
 POOLS=(20 50)
+SEEDS=(42 123)
+ORDER_PROBE_VARIANTS=(biased neutral)
 
 DRY_RUN=0
 SMOKE=0
@@ -79,6 +81,8 @@ while [ $# -gt 0 ]; do
     --variant) PROMPT_VARIANT="$2"; shift 2 ;;
     --engines) IFS=',' read -r -a ENGINES <<< "$2"; shift 2 ;;
     --pools)   IFS=',' read -r -a POOLS   <<< "$2"; shift 2 ;;
+    --seeds)   IFS=',' read -r -a SEEDS   <<< "$2"; shift 2 ;;
+    --order-probe-variants) IFS=',' read -r -a ORDER_PROBE_VARIANTS <<< "$2"; shift 2 ;;
     --help|-h)
       sed -n '2,30p' "$0"
       exit 0 ;;
@@ -195,6 +199,26 @@ if want weights; then
     TAG="${MODEL##*/}"
     emit scripts/slurm/run_weights.sbatch "wgt-${TAG}" \
       "MODEL=$MODEL"
+  done
+fi
+
+if want order_probe; then
+  total=$((${#ORDER_PROBE_VARIANTS[@]} * ${#MODELS[@]} * ${#ENGINES[@]} * ${#POOLS[@]} * ${#SEEDS[@]}))
+  echo "[dispatch] order_probe: ${#ORDER_PROBE_VARIANTS[@]} variant(s) × ${#MODELS[@]} models × ${#ENGINES[@]} engines × ${#POOLS[@]} pools × ${#SEEDS[@]} seeds = $total jobs"
+  for VARIANT in "${ORDER_PROBE_VARIANTS[@]}"; do
+    for MODEL in "${MODELS[@]}"; do
+      TAG="${MODEL##*/}"
+      for ENGINE in "${ENGINES[@]}"; do
+        for POOL in "${POOLS[@]}"; do
+          for SEED in "${SEEDS[@]}"; do
+            emit scripts/slurm/run_order_probe.sbatch \
+              "ord-${TAG}-${ENGINE}-${POOL}-${VARIANT}-s${SEED}" \
+              "MODEL=$MODEL" "ENGINE=$ENGINE" "POOL=$POOL" \
+              "PROMPT_VARIANT=$VARIANT" "SEED=$SEED"
+          done
+        done
+      done
+    done
   done
 fi
 

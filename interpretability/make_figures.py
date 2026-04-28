@@ -342,6 +342,140 @@ def figure_a_compare(output_dir: Path, data_root_path: Path) -> list[Path]:
     return outs
 
 
+def figure_e_order_sensitivity(output_dir: Path, data_root_path: Path) -> list[Path]:
+    """Order-sensitivity probe: overlap of LLM top-K under permuted input.
+
+    Reads ``data/order_probe/order_probe_summary.parquet`` and emits:
+        plots/figure_e_order_overlap_by_cell.png   - boxplot of overlap@10 per
+            (variant, model, engine, pool), one column per ordering_pair.
+        plots/figure_e_order_overlap_biased_vs_neutral.png - paired Δ
+            (neutral overlap@10 − biased overlap@10) with 95% bootstrap CI,
+            per (model, engine, pool).
+
+    No-op (with a print) if the parquet is missing or empty.
+    """
+    p = data_root_path / "data" / "order_probe" / "order_probe_summary.parquet"
+    if not p.exists():
+        print(f"[fig E] missing {p}, skipping (run order_probe_analyze first)")
+        return []
+    df = pd.read_parquet(p)
+    if df.empty:
+        print(f"[fig E] {p} has 0 rows, skipping")
+        return []
+
+    plots_dir = output_dir / "plots"
+    plots_dir.mkdir(parents=True, exist_ok=True)
+    outs: list[Path] = []
+
+    sub = df[df.K == 10].copy()
+    if sub.empty:
+        print("[fig E] no K=10 rows; skipping")
+        return []
+    sub["cell"] = sub["model"] + "/" + sub["engine"] + "/p" + sub["pool"].astype(str)
+
+    # ── Panel 1: boxplot per cell, faceted by ordering_pair ──────────────────
+    pairs = sorted(sub["ordering_pair"].unique())
+    cells = sorted(sub["cell"].unique())
+    fig, axes = plt.subplots(1, len(pairs), figsize=(5 + 2.5 * len(pairs), 6),
+                             sharey=True)
+    if len(pairs) == 1:
+        axes = [axes]
+    for ax, pair in zip(axes, pairs):
+        data = []
+        labels = []
+        for cell in cells:
+            for variant in ("biased", "neutral"):
+                vals = sub[(sub.cell == cell) & (sub.ordering_pair == pair)
+                           & (sub.variant == variant)]["overlap_at_k"].values
+                if len(vals) == 0:
+                    continue
+                data.append(vals)
+                labels.append(f"{variant[0]}|{cell}")
+        if not data:
+            ax.set_title(f"{pair} (no data)")
+            continue
+        bp = ax.boxplot(data, vert=True, patch_artist=True,
+                        boxprops=dict(facecolor="#cfe6ff", color="steelblue"),
+                        medianprops=dict(color="darkred"))
+        ax.set_xticks(range(1, len(labels) + 1))
+        ax.set_xticklabels(labels, rotation=75, fontsize=7)
+        ax.set_title(pair)
+        ax.set_ylabel("overlap@10" if ax is axes[0] else "")
+        ax.axhline(0.5, color="grey", linestyle="--", lw=0.5, alpha=0.5)
+        ax.set_ylim(0, 1.02)
+        ax.grid(alpha=0.25)
+    fig.suptitle("Figure E - LLM rerank top-10 overlap under input permutation")
+    fig.tight_layout()
+    out1 = plots_dir / "figure_e_order_overlap_by_cell.png"
+    fig.savefig(out1, dpi=200)
+    plt.close(fig)
+    print(f"[fig E] -> {out1}")
+    outs.append(out1)
+
+    # ── Panel 2: paired Δ (neutral - biased), per cell × pair ────────────────
+    have_both = (sub.groupby(["cell", "ordering_pair", "variant"])["overlap_at_k"]
+                    .mean()
+                    .unstack("variant"))
+    if "biased" in have_both.columns and "neutral" in have_both.columns:
+        rng = np.random.default_rng(0)
+
+        def _bootstrap_ci(vals: np.ndarray, n: int = 1000) -> tuple[float, float]:
+            if len(vals) < 5:
+                return (np.nan, np.nan)
+            idx = rng.integers(0, len(vals), size=(n, len(vals)))
+            means = vals[idx].mean(axis=1)
+            return (float(np.percentile(means, 2.5)),
+                    float(np.percentile(means, 97.5)))
+
+        rows = []
+        for (cell, pair), grp in sub.groupby(["cell", "ordering_pair"]):
+            b = grp[grp.variant == "biased"]["overlap_at_k"].values
+            n = grp[grp.variant == "neutral"]["overlap_at_k"].values
+            if len(b) == 0 or len(n) == 0:
+                continue
+            delta = n.mean() - b.mean()
+            # Bootstrap on the keyword-level differences (paired by keyword).
+            shared = (grp.pivot_table(index="keyword", columns="variant",
+                                      values="overlap_at_k", aggfunc="first")
+                         .dropna())
+            if shared.empty:
+                lo, hi = (np.nan, np.nan)
+            else:
+                diffs = (shared["neutral"] - shared["biased"]).values
+                lo, hi = _bootstrap_ci(diffs)
+            rows.append({"cell": cell, "ordering_pair": pair,
+                         "delta": delta, "ci_lo": lo, "ci_hi": hi,
+                         "n_paired": int(len(shared))})
+        if rows:
+            ddf = pd.DataFrame(rows)
+            pairs2 = sorted(ddf["ordering_pair"].unique())
+            fig, axes = plt.subplots(1, len(pairs2),
+                                     figsize=(5 + 2 * len(pairs2), 5),
+                                     sharey=True)
+            if len(pairs2) == 1:
+                axes = [axes]
+            for ax, pair in zip(axes, pairs2):
+                d = ddf[ddf.ordering_pair == pair].sort_values("delta")
+                ys = range(len(d))
+                ax.errorbar(d["delta"], ys,
+                            xerr=[d["delta"] - d["ci_lo"], d["ci_hi"] - d["delta"]],
+                            fmt="o", color="crimson", capsize=3)
+                ax.set_yticks(list(ys))
+                ax.set_yticklabels(d["cell"], fontsize=8)
+                ax.axvline(0, color="grey", lw=0.5)
+                ax.set_xlabel(f"Δoverlap@10 = neutral − biased  ({pair})")
+                ax.set_title(pair)
+                ax.grid(alpha=0.25)
+            fig.suptitle("Figure E delta - prompt effect on order-stability")
+            fig.tight_layout()
+            out2 = plots_dir / "figure_e_order_overlap_biased_vs_neutral.png"
+            fig.savefig(out2, dpi=200)
+            plt.close(fig)
+            print(f"[fig E] -> {out2}")
+            outs.append(out2)
+    return outs
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument(
@@ -361,6 +495,7 @@ def main() -> int:
     figure_d(out)
     if not args.skip_compare:
         figure_a_compare(out, root)
+    figure_e_order_sensitivity(out, root)
     print("[make_figures] done.")
     return 0
 
