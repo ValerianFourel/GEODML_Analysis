@@ -203,73 +203,14 @@ def _extract_domain(url: str) -> str:
     return host
 
 
-def build_rerank_prompt_with_spans(
-    keyword: str, search_results: list[dict], top_n: int = 10
-) -> tuple[str, list[dict]]:
-    """Exact template used in the original experiment, plus per-result char spans.
-
-    Returns:
-        prompt: the full prompt string
-        spans: one dict per result with keys
-            - position, url, domain
-            - line_span: (char_start, char_end) of the result line within prompt
-            - domain_span: (char_start, char_end) of the bare domain (no brackets)
-              within prompt — this is the only T7 signal the LLM actually sees.
-    """
-    header_top = (
-        f"Search keyword: {keyword}\n\n"
-        f"Below are search engine results for the above keyword. Re-rank the "
-        f"results and return the top {top_n} software product domains, ordered "
-        f"by relevance to the keyword.\n\n"
-        f"Exclude non-product sites: review aggregators, directories, Wikipedia, "
-        f"news, blogs, forums, YouTube.\n\n"
-        f"Return only root domains, one per line. No explanations.\n\n"
-        f"Search results:\n"
-    )
-
-    spans: list[dict] = []
-    parts: list[str] = []
-    cursor = 0  # offset within the assembled results_text
-    for r in search_results:
-        domain = _extract_domain(r["url"])
-        snippet = (r.get("snippet") or "")[:150]
-        prefix = f"{r['position']}. ["
-        line = f"{prefix}{domain}] {r['title']} — {snippet}\n"
-        line_start = cursor
-        domain_start = cursor + len(prefix)
-        domain_end = domain_start + len(domain)
-        line_end = cursor + len(line)
-        parts.append(line)
-        spans.append({
-            "position": r["position"],
-            "url": r["url"],
-            "domain": domain,
-            "line_span": (line_start, line_end),
-            "domain_span": (domain_start, domain_end),
-        })
-        cursor = line_end
-    results_text = "".join(parts)
-
-    prompt = header_top + results_text + "\nRe-ranked product domains:"
-    base = len(header_top)
-    for s in spans:
-        ls, le = s["line_span"]
-        ds, de = s["domain_span"]
-        s["line_span"] = (base + ls, base + le)
-        s["domain_span"] = (base + ds, base + de)
-
-    return prompt, spans
-
-
-def build_rerank_prompt(
-    keyword: str, search_results: list[dict], top_n: int = 10
-) -> str:
-    """Exact template used in the original experiment.
-
-    `search_results` items must have keys: position, title, url, snippet.
-    """
-    prompt, _ = build_rerank_prompt_with_spans(keyword, search_results, top_n=top_n)
-    return prompt
+# Re-exported from interpretability.pipeline.prompts so the variant selection
+# (PROMPT_VARIANT env var / variant= kwarg) is honored in every call site
+# (ablation.py, saliency.py, probing.py, weight_analysis.py).
+# The biased default reproduces the original prompt byte-for-byte.
+from interpretability.pipeline.prompts import (  # noqa: E402
+    build_rerank_prompt,
+    build_rerank_prompt_with_spans,
+)
 
 
 def parse_ranked_domains(llm_output: str) -> list[str]:

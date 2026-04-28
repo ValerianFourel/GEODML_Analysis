@@ -29,6 +29,18 @@ load_dotenv()
 FRAME_SUFFIX = {"full": "_full", "robust_winners": "_rw"}
 
 
+def _load_dml_variant(root: Path, variant: str) -> pd.DataFrame | None:
+    """Try variant-suffixed parquet first; fall back to legacy un-suffixed for biased."""
+    p = root / "data" / "dml_results" / f"dml_results_long_{variant}.parquet"
+    if p.exists():
+        return pd.read_parquet(p)
+    if variant == "biased":
+        legacy = root / "data" / "dml_results" / "dml_results_long.parquet"
+        if legacy.exists():
+            return pd.read_parquet(legacy)
+    return None
+
+
 def _resolve_frame_inputs(output_dir: Path, stem: str) -> dict[str, Path]:
     """Return {frame: path} for any frame-suffixed CSVs that exist."""
     found: dict[str, Path] = {}
@@ -221,6 +233,115 @@ def figure_d(output_dir: Path) -> list[Path]:
     return outs
 
 
+def figure_a_compare(output_dir: Path, data_root_path: Path) -> list[Path]:
+    """Side-by-side biased vs neutral DML coefficients + delta plot.
+
+    Reads ``dml_results_long_{biased,neutral}.parquet`` if present and emits:
+        plots/figure_a_dml_biased.png   - one subplot per outcome (POOLED subset)
+        plots/figure_a_dml_neutral.png  - one subplot per outcome (POOLED subset)
+        plots/figure_a_dml_delta.png    - per-treatment Δcoef = neutral − biased
+
+    No-op (with a print) if neither variant parquet exists. If only one exists,
+    emits that single panel and skips the delta plot.
+    """
+    df_b = _load_dml_variant(data_root_path, "biased")
+    df_n = _load_dml_variant(data_root_path, "neutral")
+    if df_b is None and df_n is None:
+        print(f"[fig A_compare] no dml_results_long_{{biased,neutral}}.parquet found "
+              f"under {data_root_path}/data/dml_results/, skipping")
+        return []
+
+    plots_dir = output_dir / "plots"
+    plots_dir.mkdir(parents=True, exist_ok=True)
+    outs: list[Path] = []
+
+    def _draw_single(df: pd.DataFrame, title: str, out_path: Path) -> None:
+        # POOLED subset, default learner=lgbm, method=plr.
+        sub = df[(df["subset"] == "POOLED")
+                 & (df["method"] == "plr")
+                 & (df["learner"] == "lgbm")
+                 & df["coef"].notna()]
+        if sub.empty:
+            print(f"[fig A_compare] {title}: no POOLED+plr+lgbm rows, skipping")
+            return
+        outcomes = sorted(sub["outcome"].unique())
+        fig, axes = plt.subplots(1, len(outcomes), figsize=(5.5 * len(outcomes), 5.5),
+                                 sharey=True)
+        if len(outcomes) == 1:
+            axes = [axes]
+        for ax, outcome in zip(axes, outcomes):
+            s = sub[sub.outcome == outcome].sort_values("coef")
+            ax.errorbar(
+                s["coef"], range(len(s)),
+                xerr=1.96 * s["se"],
+                fmt="o", color="steelblue", capsize=3,
+            )
+            ax.set_yticks(range(len(s)))
+            ax.set_yticklabels(s["treatment"], fontsize=8)
+            ax.axvline(0, color="grey", lw=0.5)
+            ax.set_xlabel(f"DML coefficient on {outcome}")
+            ax.set_title(outcome)
+            ax.grid(alpha=0.25)
+        fig.suptitle(title)
+        fig.tight_layout()
+        fig.savefig(out_path, dpi=200)
+        plt.close(fig)
+        print(f"[fig A_compare] -> {out_path}")
+        outs.append(out_path)
+
+    if df_b is not None:
+        _draw_single(df_b, "Figure A - DML coefficients [biased prompt]",
+                     plots_dir / "figure_a_dml_biased.png")
+    if df_n is not None:
+        _draw_single(df_n, "Figure A - DML coefficients [neutral prompt]",
+                     plots_dir / "figure_a_dml_neutral.png")
+
+    # Delta plot only if both variants exist.
+    if df_b is not None and df_n is not None:
+        keys = ["subset", "outcome", "treatment", "method", "learner"]
+        join = df_b.merge(df_n, on=keys, suffixes=("_b", "_n"))
+        join = join[(join["subset"] == "POOLED")
+                    & (join["method"] == "plr")
+                    & (join["learner"] == "lgbm")
+                    & join["coef_b"].notna()
+                    & join["coef_n"].notna()]
+        if join.empty:
+            print("[fig A_compare] no overlapping POOLED+plr+lgbm rows for delta plot")
+            return outs
+
+        join["delta"] = join["coef_n"] - join["coef_b"]
+        # Combined SE under independence: sqrt(se_b^2 + se_n^2).
+        join["delta_se"] = np.sqrt(join["se_b"]**2 + join["se_n"]**2)
+        outcomes = sorted(join["outcome"].unique())
+
+        fig, axes = plt.subplots(1, len(outcomes), figsize=(5.5 * len(outcomes), 5.5),
+                                 sharey=True)
+        if len(outcomes) == 1:
+            axes = [axes]
+        for ax, outcome in zip(axes, outcomes):
+            s = join[join.outcome == outcome].sort_values("delta")
+            ax.errorbar(
+                s["delta"], range(len(s)),
+                xerr=1.96 * s["delta_se"],
+                fmt="o", color="crimson", capsize=3,
+            )
+            ax.set_yticks(range(len(s)))
+            ax.set_yticklabels(s["treatment"], fontsize=8)
+            ax.axvline(0, color="grey", lw=0.5)
+            ax.set_xlabel(f"Δcoef = neutral − biased  ({outcome})")
+            ax.set_title(outcome)
+            ax.grid(alpha=0.25)
+        fig.suptitle("Figure A delta - prompt-bias attributable shift in DML coefficients")
+        fig.tight_layout()
+        out = plots_dir / "figure_a_dml_delta.png"
+        fig.savefig(out, dpi=200)
+        plt.close(fig)
+        print(f"[fig A_compare] -> {out}")
+        outs.append(out)
+
+    return outs
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument(
@@ -228,6 +349,8 @@ def main() -> int:
         default=str(Path(__file__).resolve().parent / "output"),
     )
     ap.add_argument("--data-root", default=None)
+    ap.add_argument("--skip-compare", action="store_true",
+                    help="Skip figure_a_compare (biased vs neutral) even if both exist.")
     args = ap.parse_args()
 
     out = Path(args.output_dir)
@@ -236,6 +359,8 @@ def main() -> int:
     figure_b(out)
     figure_c(out)
     figure_d(out)
+    if not args.skip_compare:
+        figure_a_compare(out, root)
     print("[make_figures] done.")
     return 0
 

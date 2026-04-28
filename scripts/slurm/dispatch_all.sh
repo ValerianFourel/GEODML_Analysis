@@ -48,6 +48,8 @@ TREATMENTS=(
   T1b_stats_density
 )
 FRAMES=(full robust_winners)
+ENGINES=(searxng ddg)
+POOLS=(20 50)
 
 DRY_RUN=0
 SMOKE=0
@@ -56,6 +58,7 @@ MODELS=("${DEFAULT_MODELS[@]}")
 PARTITION=""
 TIME_OVERRIDE=""
 SAMPLE_N=""
+PROMPT_VARIANT="${PROMPT_VARIANT:-biased}"
 MAX_ATTEMPTS="${MAX_ATTEMPTS:-6}"
 
 while [ $# -gt 0 ]; do
@@ -73,6 +76,9 @@ while [ $# -gt 0 ]; do
     --partition) PARTITION="$2"; shift 2 ;;
     --time) TIME_OVERRIDE="$2"; shift 2 ;;
     --sample-n) SAMPLE_N="$2"; shift 2 ;;
+    --variant) PROMPT_VARIANT="$2"; shift 2 ;;
+    --engines) IFS=',' read -r -a ENGINES <<< "$2"; shift 2 ;;
+    --pools)   IFS=',' read -r -a POOLS   <<< "$2"; shift 2 ;;
     --help|-h)
       sed -n '2,30p' "$0"
       exit 0 ;;
@@ -123,34 +129,63 @@ want() {
   [ "$ONLY" = "$1" ]
 }
 
+if want rerank; then
+  echo "[dispatch] rerank: ${#MODELS[@]} models × ${#ENGINES[@]} engines × ${#POOLS[@]} pools  variant=$PROMPT_VARIANT"
+  for MODEL in "${MODELS[@]}"; do
+    TAG="${MODEL##*/}"
+    for ENGINE in "${ENGINES[@]}"; do
+      for POOL in "${POOLS[@]}"; do
+        emit scripts/slurm/run_rerank.sbatch "rerank-${TAG}-${ENGINE}-${POOL}-${PROMPT_VARIANT}" \
+          "MODEL=$MODEL" "ENGINE=$ENGINE" "POOL=$POOL" "PROMPT_VARIANT=$PROMPT_VARIANT"
+      done
+    done
+  done
+fi
+
+if want features; then
+  echo "[dispatch] features: ${#ENGINES[@]} engines × ${#POOLS[@]} pools"
+  for ENGINE in "${ENGINES[@]}"; do
+    for POOL in "${POOLS[@]}"; do
+      emit scripts/slurm/run_features.sbatch "features-${ENGINE}-${POOL}" \
+        "ENGINE=$ENGINE" "POOL=$POOL"
+    done
+  done
+fi
+
+if want dml; then
+  echo "[dispatch] dml: variant=$PROMPT_VARIANT"
+  emit scripts/slurm/run_dml.sbatch "dml-${PROMPT_VARIANT}" \
+    "PROMPT_VARIANT=$PROMPT_VARIANT"
+fi
+
 if want ablation; then
-  echo "[dispatch] ablation: ${#MODELS[@]} models × ${#TREATMENTS[@]} treatments"
+  echo "[dispatch] ablation: ${#MODELS[@]} models × ${#TREATMENTS[@]} treatments  variant=$PROMPT_VARIANT"
   for MODEL in "${MODELS[@]}"; do
     TAG="${MODEL##*/}"
     for T in "${TREATMENTS[@]}"; do
-      emit scripts/slurm/run_ablation.sbatch "abl-${TAG}-${T}" \
-        "MODEL=$MODEL" "TREATMENT=$T"
+      emit scripts/slurm/run_ablation.sbatch "abl-${TAG}-${T}-${PROMPT_VARIANT}" \
+        "MODEL=$MODEL" "TREATMENT=$T" "PROMPT_VARIANT=$PROMPT_VARIANT"
     done
   done
 fi
 
 if want saliency; then
-  echo "[dispatch] saliency: ${#MODELS[@]} models × ${#FRAMES[@]} frames"
+  echo "[dispatch] saliency: ${#MODELS[@]} models × ${#FRAMES[@]} frames  variant=$PROMPT_VARIANT"
   for MODEL in "${MODELS[@]}"; do
     TAG="${MODEL##*/}"
     for F in "${FRAMES[@]}"; do
-      emit scripts/slurm/run_saliency.sbatch "sal-${TAG}-${F}" \
-        "MODEL=$MODEL" "FRAME=$F"
+      emit scripts/slurm/run_saliency.sbatch "sal-${TAG}-${F}-${PROMPT_VARIANT}" \
+        "MODEL=$MODEL" "FRAME=$F" "PROMPT_VARIANT=$PROMPT_VARIANT"
     done
   done
 fi
 
 if want probing; then
-  echo "[dispatch] probing: ${#MODELS[@]} models (frame=both)"
+  echo "[dispatch] probing: ${#MODELS[@]} models (frame=both)  variant=$PROMPT_VARIANT"
   for MODEL in "${MODELS[@]}"; do
     TAG="${MODEL##*/}"
-    emit scripts/slurm/run_probing.sbatch "prob-${TAG}" \
-      "MODEL=$MODEL"
+    emit scripts/slurm/run_probing.sbatch "prob-${TAG}-${PROMPT_VARIANT}" \
+      "MODEL=$MODEL" "PROMPT_VARIANT=$PROMPT_VARIANT"
   done
 fi
 
