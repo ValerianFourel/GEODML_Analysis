@@ -31,12 +31,14 @@ source "$SLURM_SUBMIT_DIR/scripts/slurm/_common.sh"
 : "${TREATMENT:?TREATMENT must be set, e.g. T7_source_earned}"
 : "${SAMPLE_N:=100000}"
 : "${FRAME:=both}"
+: "${PROMPT_VARIANT:=biased}"
+export PROMPT_VARIANT
 
 MODEL_TAG="${MODEL##*/}"
-OUTDIR="$SLURM_SUBMIT_DIR/interpretability/output/ablation_${TREATMENT}_${MODEL_TAG}"
+OUTDIR="$SLURM_SUBMIT_DIR/interpretability/output/ablation_${TREATMENT}_${MODEL_TAG}_${PROMPT_VARIANT}"
 mkdir -p "$OUTDIR"
 
-echo "[ablation] model=$MODEL treatment=$TREATMENT frame=$FRAME sample_n=$SAMPLE_N"
+echo "[ablation] model=$MODEL treatment=$TREATMENT frame=$FRAME sample_n=$SAMPLE_N variant=$PROMPT_VARIANT"
 echo "[ablation] outdir=$OUTDIR"
 
 set +e
@@ -60,5 +62,6 @@ fi
 
 chain_resubmit "$0" \
   MODEL="$MODEL" TREATMENT="$TREATMENT" SAMPLE_N="$SAMPLE_N" FRAME="$FRAME" \
+  PROMPT_VARIANT="$PROMPT_VARIANT" \
   || exit "$RC"
 exit 0

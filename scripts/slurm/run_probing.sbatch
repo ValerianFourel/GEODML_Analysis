@@ -30,17 +30,20 @@ source "$SLURM_SUBMIT_DIR/scripts/slurm/_common.sh"
 : "${SAMPLE_N:=100000}"
 : "${T7_KWS:=100000}"
 : "${FRAME:=both}"
+: "${PROMPT_VARIANT:=biased}"
+export PROMPT_VARIANT
 
 MODEL_TAG="${MODEL##*/}"
-OUTDIR="$SLURM_SUBMIT_DIR/interpretability/output/probing_${MODEL_TAG}"
+OUTDIR="$SLURM_SUBMIT_DIR/interpretability/output/probing_${MODEL_TAG}_${PROMPT_VARIANT}"
 mkdir -p "$OUTDIR"
 
-# Auto-pick the matching SearXNG run if RUN_FILTER wasn't passed.
+# Auto-pick the matching SearXNG run if RUN_FILTER wasn't passed. Pull from
+# the variant-suffixed run dir so probing reads the right rerank output.
 if [ -z "${RUN_FILTER:-}" ]; then
-  RUN_FILTER="searxng_${MODEL_TAG}_serp50_top10"
+  RUN_FILTER="searxng_${MODEL_TAG}_serp50_top10_${PROMPT_VARIANT}"
 fi
 
-echo "[probing] model=$MODEL frame=$FRAME sample_n=$SAMPLE_N t7_kws=$T7_KWS"
+echo "[probing] model=$MODEL frame=$FRAME sample_n=$SAMPLE_N t7_kws=$T7_KWS variant=$PROMPT_VARIANT"
 echo "[probing] run_filter=$RUN_FILTER"
 echo "[probing] outdir=$OUTDIR"
 
@@ -65,6 +68,6 @@ fi
 
 chain_resubmit "$0" \
   MODEL="$MODEL" SAMPLE_N="$SAMPLE_N" T7_KWS="$T7_KWS" FRAME="$FRAME" \
-  RUN_FILTER="$RUN_FILTER" \
+  RUN_FILTER="$RUN_FILTER" PROMPT_VARIANT="$PROMPT_VARIANT" \
   || exit "$RC"
 exit 0

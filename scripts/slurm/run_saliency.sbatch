@@ -25,12 +25,14 @@ source "$SLURM_SUBMIT_DIR/scripts/slurm/_common.sh"
 : "${MODEL:?MODEL must be set, e.g. meta-llama/Llama-3.3-70B-Instruct}"
 : "${FRAME:?FRAME must be set: full | robust_winners}"
 : "${SAMPLE_N:=100000}"
+: "${PROMPT_VARIANT:=biased}"
+export PROMPT_VARIANT
 
 MODEL_TAG="${MODEL##*/}"
-OUTDIR="$SLURM_SUBMIT_DIR/interpretability/output/saliency_${MODEL_TAG}"
+OUTDIR="$SLURM_SUBMIT_DIR/interpretability/output/saliency_${MODEL_TAG}_${PROMPT_VARIANT}"
 mkdir -p "$OUTDIR"
 
-echo "[saliency] model=$MODEL frame=$FRAME sample_n=$SAMPLE_N"
+echo "[saliency] model=$MODEL frame=$FRAME sample_n=$SAMPLE_N variant=$PROMPT_VARIANT"
 echo "[saliency] outdir=$OUTDIR"
 
 set +e
@@ -54,5 +56,6 @@ fi
 
 chain_resubmit "$0" \
   MODEL="$MODEL" FRAME="$FRAME" SAMPLE_N="$SAMPLE_N" \
+  PROMPT_VARIANT="$PROMPT_VARIANT" \
   || exit "$RC"
 exit 0

@@ -27,6 +27,25 @@ load_dotenv()
 
 
 FRAME_SUFFIX = {"full": "_full", "robust_winners": "_rw"}
+KNOWN_VARIANTS = ("biased", "neutral")
+
+
+def _resolve_variant_csv(output_dir: Path, stem: str) -> dict[str, Path]:
+    """Find variant-suffixed merged CSVs, falling back to the un-suffixed
+    legacy file as the 'biased' variant.
+
+    Returns ``{variant: path}`` for whichever variants have a CSV present.
+    """
+    found: dict[str, Path] = {}
+    for v in KNOWN_VARIANTS:
+        p = output_dir / f"{stem}_{v}.csv"
+        if p.exists():
+            found[v] = p
+    if "biased" not in found:
+        legacy = output_dir / f"{stem}.csv"
+        if legacy.exists():
+            found["biased"] = legacy
+    return found
 
 
 def _load_dml_variant(root: Path, variant: str) -> pd.DataFrame | None:
@@ -41,13 +60,25 @@ def _load_dml_variant(root: Path, variant: str) -> pd.DataFrame | None:
     return None
 
 
-def _resolve_frame_inputs(output_dir: Path, stem: str) -> dict[str, Path]:
-    """Return {frame: path} for any frame-suffixed CSVs that exist."""
+def _resolve_frame_inputs(output_dir: Path, stem: str,
+                          variant: str | None = None) -> dict[str, Path]:
+    """Return {frame: path} for any frame-suffixed CSVs that exist.
+
+    When ``variant`` is given (e.g. ``"biased"``), looks for
+    ``{stem}{frame_suffix}_{variant}.csv`` first and falls back to the
+    legacy un-suffixed file. When ``variant`` is None, only the legacy
+    layout is searched (preserves pre-port behavior).
+    """
     found: dict[str, Path] = {}
     for frame, suf in FRAME_SUFFIX.items():
-        p = output_dir / f"{stem}{suf}.csv"
-        if p.exists():
-            found[frame] = p
+        candidates: list[Path] = []
+        if variant is not None:
+            candidates.append(output_dir / f"{stem}{suf}_{variant}.csv")
+        candidates.append(output_dir / f"{stem}{suf}.csv")
+        for p in candidates:
+            if p.exists():
+                found[frame] = p
+                break
     if not found:
         legacy = output_dir / f"{stem}.csv"
         if legacy.exists():
@@ -56,142 +87,200 @@ def _resolve_frame_inputs(output_dir: Path, stem: str) -> dict[str, Path]:
 
 
 def figure_a(output_dir: Path, data_root_path: Path) -> list[Path]:
-    found = _resolve_frame_inputs(output_dir, "ablation_results")
-    if not found:
+    """Per-variant ablation × DML scatter. Looks for variant-suffixed
+    ``ablation_results_{full,rw}_{variant}.csv`` first; falls back to
+    legacy un-suffixed paths (treated as 'biased')."""
+    outs: list[Path] = []
+    # Discover which variants have ablation_results CSVs available.
+    discovered: dict[str, dict[str, Path]] = {}
+    for v in KNOWN_VARIANTS:
+        found_v = _resolve_frame_inputs(output_dir, "ablation_results", variant=v)
+        # Filter to variant-suffixed files only when v is known; the helper
+        # may have returned a legacy path which we reserve for the un-tagged
+        # call below.
+        found_v = {fr: p for fr, p in found_v.items()
+                   if p.name.endswith(f"_{v}.csv")}
+        if found_v:
+            discovered[v] = found_v
+    # Legacy un-suffixed (only used if no variant-suffixed CSV at all).
+    if not discovered:
+        legacy = _resolve_frame_inputs(output_dir, "ablation_results")
+        if legacy:
+            discovered["biased"] = legacy
+    if not discovered:
         print(f"[fig A] no ablation_results*.csv in {output_dir}, skipping")
         return []
 
-    dml = load_dml_long(data_root_path)
-    dml = dml[(dml.subset == "POOLED") & (dml.outcome == "rank_delta")]
-    dml_coefs = dml.set_index("treatment")["coef"].to_dict()
+    for variant, found in discovered.items():
+        # DML lookup respects the same variant.
+        dml = _load_dml_variant(data_root_path, variant)
+        if dml is None:
+            print(f"[fig A] no DML parquet for variant={variant}, skipping ablation×DML scatter")
+            continue
+        dml = dml[(dml.subset == "POOLED") & (dml.outcome == "rank_delta")]
+        dml_coefs = dml.set_index("treatment")["coef"].to_dict()
 
-    outs: list[Path] = []
-    for frame, abl_path in found.items():
-        abl = pd.read_csv(abl_path)
-        agg = (
-            abl.groupby("treatment")["ablation_delta"]
-            .agg(["mean", "sem", "count"])
-            .reset_index()
-        )
-        agg["dml_coef"] = agg["treatment"].map(dml_coefs)
-        agg = agg.dropna(subset=["dml_coef"])
-
-        fig, ax = plt.subplots(figsize=(7, 5.5))
-        ax.axhline(0, color="grey", lw=0.5)
-        ax.axvline(0, color="grey", lw=0.5)
-
-        if not agg.empty:
-            xs = agg["dml_coef"].to_numpy()
-            ref_x = np.linspace(xs.min() * 1.1, xs.max() * 1.1, 50)
-            ax.plot(ref_x, -ref_x, "--", color="crimson", alpha=0.6,
-                    label="Perfect agreement: y = -x")
-
-        ax.errorbar(
-            agg["dml_coef"], agg["mean"], yerr=agg["sem"],
-            fmt="o", color="steelblue", capsize=3, label="treatment",
-        )
-        for _, r in agg.iterrows():
-            ax.annotate(
-                r["treatment"], (r["dml_coef"], r["mean"]),
-                xytext=(4, 4), textcoords="offset points", fontsize=8,
+        for frame, abl_path in found.items():
+            abl = pd.read_csv(abl_path)
+            agg = (
+                abl.groupby("treatment")["ablation_delta"]
+                .agg(["mean", "sem", "count"])
+                .reset_index()
             )
-        ax.set_xlabel("DML coefficient on rank_delta (higher = promoter)")
-        ax.set_ylabel("Mean ablation_delta (higher = ablation hurt the page)")
-        ax.set_title(f"Figure A — DML vs direct input ablation [{frame}]")
-        ax.legend(loc="best", fontsize=9)
-        out = output_dir / "plots" / f"figure_a_ablation{FRAME_SUFFIX[frame]}.png"
-        out.parent.mkdir(parents=True, exist_ok=True)
-        fig.tight_layout()
-        fig.savefig(out, dpi=200)
-        plt.close(fig)
-        print(f"[fig A] -> {out}  (frame={frame}, n_treatments={len(agg)})")
-        outs.append(out)
+            agg["dml_coef"] = agg["treatment"].map(dml_coefs)
+            agg = agg.dropna(subset=["dml_coef"])
+
+            fig, ax = plt.subplots(figsize=(7, 5.5))
+            ax.axhline(0, color="grey", lw=0.5)
+            ax.axvline(0, color="grey", lw=0.5)
+
+            if not agg.empty:
+                xs = agg["dml_coef"].to_numpy()
+                ref_x = np.linspace(xs.min() * 1.1, xs.max() * 1.1, 50)
+                ax.plot(ref_x, -ref_x, "--", color="crimson", alpha=0.6,
+                        label="Perfect agreement: y = -x")
+
+            ax.errorbar(
+                agg["dml_coef"], agg["mean"], yerr=agg["sem"],
+                fmt="o", color="steelblue", capsize=3, label="treatment",
+            )
+            for _, r in agg.iterrows():
+                ax.annotate(
+                    r["treatment"], (r["dml_coef"], r["mean"]),
+                    xytext=(4, 4), textcoords="offset points", fontsize=8,
+                )
+            ax.set_xlabel("DML coefficient on rank_delta (higher = promoter)")
+            ax.set_ylabel("Mean ablation_delta (higher = ablation hurt the page)")
+            ax.set_title(f"Figure A — DML vs direct input ablation [{frame}, {variant}]")
+            ax.legend(loc="best", fontsize=9)
+            stem = f"figure_a_ablation{FRAME_SUFFIX[frame]}_{variant}"
+            out = output_dir / "plots" / f"{stem}.png"
+            out.parent.mkdir(parents=True, exist_ok=True)
+            fig.tight_layout()
+            fig.savefig(out, dpi=200)
+            plt.close(fig)
+            print(f"[fig A] -> {out}  (frame={frame}, variant={variant}, n_treatments={len(agg)})")
+            outs.append(out)
+            # For 'biased' also drop a legacy alias so older readers / docs work.
+            if variant == "biased":
+                legacy = output_dir / "plots" / f"figure_a_ablation{FRAME_SUFFIX[frame]}.png"
+                fig.tight_layout()
+                # Re-save under legacy name (cheap; we already have the figure closed,
+                # so just write the alias as a copy of the canonical file).
+                import shutil
+                shutil.copyfile(out, legacy)
     return outs
 
 
 def figure_b(output_dir: Path) -> list[Path]:
-    found = _resolve_frame_inputs(output_dir, "saliency_summary")
-    if not found:
+    """Per-variant saliency heatmap. Falls back to legacy un-suffixed CSVs."""
+    outs: list[Path] = []
+    discovered: dict[str, dict[str, Path]] = {}
+    for v in KNOWN_VARIANTS:
+        f_v = _resolve_frame_inputs(output_dir, "saliency_summary", variant=v)
+        f_v = {fr: p for fr, p in f_v.items()
+               if p.name.endswith(f"_{v}.csv")}
+        if f_v:
+            discovered[v] = f_v
+    if not discovered:
+        legacy = _resolve_frame_inputs(output_dir, "saliency_summary")
+        if legacy:
+            discovered["biased"] = legacy
+    if not discovered:
         print(f"[fig B] no saliency_summary*.csv in {output_dir}, skipping")
         return []
 
-    outs: list[Path] = []
-    for frame, summary_path in found.items():
-        summary = pd.read_csv(summary_path)
-        fig, ax = plt.subplots(figsize=(8, 4.5))
+    for variant, found in discovered.items():
+        for frame, summary_path in found.items():
+            summary = pd.read_csv(summary_path)
+            fig, ax = plt.subplots(figsize=(8, 4.5))
 
-        piv = summary.set_index("treatment")[
-            ["mean_treatment_saliency", "mean_other_saliency"]
-        ]
-        piv.columns = ["treatment tokens", "other tokens"]
-        sns.heatmap(piv.T, annot=True, fmt=".3f", cmap="mako", ax=ax, cbar=True)
-        ax.set_title(f"Figure B — Mean gradient×input saliency [{frame}]")
-        out = output_dir / "plots" / f"figure_b_saliency{FRAME_SUFFIX[frame]}.png"
+            piv = summary.set_index("treatment")[
+                ["mean_treatment_saliency", "mean_other_saliency"]
+            ]
+            piv.columns = ["treatment tokens", "other tokens"]
+            sns.heatmap(piv.T, annot=True, fmt=".3f", cmap="mako", ax=ax, cbar=True)
+            ax.set_title(f"Figure B — Mean gradient×input saliency [{frame}, {variant}]")
+            stem = f"figure_b_saliency{FRAME_SUFFIX[frame]}_{variant}"
+            out = output_dir / "plots" / f"{stem}.png"
+            out.parent.mkdir(parents=True, exist_ok=True)
+            fig.tight_layout()
+            fig.savefig(out, dpi=200)
+            plt.close(fig)
+            print(f"[fig B] -> {out}  (frame={frame}, variant={variant})")
+            outs.append(out)
+            if variant == "biased":
+                import shutil
+                shutil.copyfile(
+                    out,
+                    output_dir / "plots" / f"figure_b_saliency{FRAME_SUFFIX[frame]}.png",
+                )
+    return outs
+
+
+def figure_c(output_dir: Path) -> list[Path]:
+    """Per-variant probing curves."""
+    paths = _resolve_variant_csv(output_dir, "probing_results")
+    if not paths:
+        print(f"[fig C] missing probing_results*.csv in {output_dir}, skipping")
+        return []
+    outs: list[Path] = []
+    for variant, probing_path in paths.items():
+        df = pd.read_csv(probing_path)
+        has_frame = "frame" in df.columns and df["frame"].nunique() > 1
+        fig, axes = plt.subplots(1, 2, figsize=(11, 4.5), sharey=True)
+        treatments = sorted(df["treatment"].unique())
+        cmap = plt.get_cmap("tab10")
+        treat_colors = {t: cmap(i % 10) for i, t in enumerate(treatments)}
+        frame_styles = {"full": "--", "robust_winners": "-"}
+        for ax, pooling in zip(axes, ["last_token", "mean"]):
+            sub = df[df.pooling == pooling]
+            if has_frame:
+                for (t, fr), g in sub.groupby(["treatment", "frame"]):
+                    g = g.sort_values("layer")
+                    ax.plot(
+                        g["layer"], g["accuracy"],
+                        marker="o", markersize=3, lw=1.2,
+                        color=treat_colors[t],
+                        linestyle=frame_styles.get(fr, "-"),
+                        label=f"{t} [{fr}]",
+                    )
+            else:
+                for t, g in sub.groupby("treatment"):
+                    g = g.sort_values("layer")
+                    ax.plot(g["layer"], g["accuracy"], marker="o", lw=1.2,
+                            color=treat_colors[t], label=t)
+            ax.axhline(0.5, ls=":", color="grey", lw=0.6, label="chance")
+            ax.set_xlabel("layer")
+            ax.set_title(f"pooling = {pooling}")
+            ax.grid(alpha=0.25)
+        axes[0].set_ylabel("probe test accuracy")
+        axes[0].legend(loc="best", fontsize=7, ncol=2 if has_frame else 1)
+        suffix = "frames" if has_frame else "single"
+        fig.suptitle(
+            f"Figure C — Probing accuracy by layer "
+            f"({'full vs robust_winners' if has_frame else 'single frame'})  [{variant}]"
+        )
+        out = output_dir / "plots" / f"figure_c_probing_{variant}.png"
         out.parent.mkdir(parents=True, exist_ok=True)
         fig.tight_layout()
         fig.savefig(out, dpi=200)
         plt.close(fig)
-        print(f"[fig B] -> {out}  (frame={frame})")
+        print(f"[fig C] -> {out}  ({suffix}, variant={variant})")
         outs.append(out)
+        if variant == "biased":
+            import shutil
+            shutil.copyfile(out, output_dir / "plots" / "figure_c_probing.png")
     return outs
 
 
-def figure_c(output_dir: Path) -> Path:
-    probing_path = output_dir / "probing_results.csv"
-    if not probing_path.exists():
-        print(f"[fig C] missing {probing_path}, skipping")
-        return Path()
-    df = pd.read_csv(probing_path)
-    has_frame = "frame" in df.columns and df["frame"].nunique() > 1
-    fig, axes = plt.subplots(1, 2, figsize=(11, 4.5), sharey=True)
-    treatments = sorted(df["treatment"].unique())
-    cmap = plt.get_cmap("tab10")
-    treat_colors = {t: cmap(i % 10) for i, t in enumerate(treatments)}
-    frame_styles = {"full": "--", "robust_winners": "-"}
-    for ax, pooling in zip(axes, ["last_token", "mean"]):
-        sub = df[df.pooling == pooling]
-        if has_frame:
-            for (t, fr), g in sub.groupby(["treatment", "frame"]):
-                g = g.sort_values("layer")
-                ax.plot(
-                    g["layer"], g["accuracy"],
-                    marker="o", markersize=3, lw=1.2,
-                    color=treat_colors[t],
-                    linestyle=frame_styles.get(fr, "-"),
-                    label=f"{t} [{fr}]",
-                )
-        else:
-            for t, g in sub.groupby("treatment"):
-                g = g.sort_values("layer")
-                ax.plot(g["layer"], g["accuracy"], marker="o", lw=1.2,
-                        color=treat_colors[t], label=t)
-        ax.axhline(0.5, ls=":", color="grey", lw=0.6, label="chance")
-        ax.set_xlabel("layer")
-        ax.set_title(f"pooling = {pooling}")
-        ax.grid(alpha=0.25)
-    axes[0].set_ylabel("probe test accuracy")
-    axes[0].legend(loc="best", fontsize=7, ncol=2 if has_frame else 1)
-    suffix = "frames" if has_frame else "single"
-    fig.suptitle(
-        f"Figure C — Probing accuracy by layer "
-        f"({'full vs robust_winners' if has_frame else 'single frame'})"
-    )
-    out = output_dir / "plots" / "figure_c_probing.png"
-    out.parent.mkdir(parents=True, exist_ok=True)
-    fig.tight_layout()
-    fig.savefig(out, dpi=200)
-    plt.close(fig)
-    print(f"[fig C] -> {out}  ({suffix})")
-    return out
-
-
 def figure_d(output_dir: Path) -> list[Path]:
-    """Two panels: logit-lens curve (left), head-importance heatmap (right)."""
-    lens_path = output_dir / "logit_lens.csv"
-    heads_path = output_dir / "attention_heads.csv"
+    """Per-variant logit-lens curve + head-importance heatmap."""
+    lens_paths = _resolve_variant_csv(output_dir, "logit_lens")
+    heads_paths = _resolve_variant_csv(output_dir, "attention_heads")
     outs: list[Path] = []
 
-    if lens_path.exists():
+    for variant, lens_path in lens_paths.items():
         lens = pd.read_csv(lens_path)
         curve = (lens.groupby("layer")["domain_token_prob_mass"]
                  .agg(["mean", "sem"]).reset_index())
@@ -205,30 +294,38 @@ def figure_d(output_dir: Path) -> list[Path]:
         )
         ax.set_xlabel("layer")
         ax.set_ylabel("P(domain-like token | decision position)")
-        ax.set_title("Figure D1 — Logit lens: when does the ranker decide on a domain?")
+        ax.set_title(f"Figure D1 — Logit lens: when does the ranker decide on a domain? [{variant}]")
         ax.grid(alpha=0.25)
-        out = output_dir / "plots" / "figure_d1_logit_lens.png"
+        out = output_dir / "plots" / f"figure_d1_logit_lens_{variant}.png"
+        out.parent.mkdir(parents=True, exist_ok=True)
         fig.tight_layout()
         fig.savefig(out, dpi=200)
         plt.close(fig)
         outs.append(out)
-        print(f"[fig D1] -> {out}")
+        print(f"[fig D1] -> {out}  (variant={variant})")
+        if variant == "biased":
+            import shutil
+            shutil.copyfile(out, output_dir / "plots" / "figure_d1_logit_lens.png")
 
-    if heads_path.exists():
+    for variant, heads_path in heads_paths.items():
         heads = pd.read_csv(heads_path)
         piv = (heads.groupby(["layer", "head"])["attn_to_url"].mean()
                .unstack("head"))
         fig, ax = plt.subplots(figsize=(9, 6))
         sns.heatmap(piv, cmap="magma", ax=ax, cbar_kws={"label": "mean attn to URL"})
-        ax.set_title("Figure D2 — Attention head importance for URL tokens")
+        ax.set_title(f"Figure D2 — Attention head importance for URL tokens [{variant}]")
         ax.set_xlabel("head")
         ax.set_ylabel("layer")
-        out = output_dir / "plots" / "figure_d2_head_importance.png"
+        out = output_dir / "plots" / f"figure_d2_head_importance_{variant}.png"
+        out.parent.mkdir(parents=True, exist_ok=True)
         fig.tight_layout()
         fig.savefig(out, dpi=200)
         plt.close(fig)
         outs.append(out)
-        print(f"[fig D2] -> {out}")
+        print(f"[fig D2] -> {out}  (variant={variant})")
+        if variant == "biased":
+            import shutil
+            shutil.copyfile(out, output_dir / "plots" / "figure_d2_head_importance.png")
 
     return outs
 

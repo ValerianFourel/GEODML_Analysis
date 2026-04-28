@@ -194,11 +194,11 @@ if want probing; then
 fi
 
 if want weights; then
-  echo "[dispatch] weights: ${#MODELS[@]} models"
+  echo "[dispatch] weights: ${#MODELS[@]} models  variant=$PROMPT_VARIANT"
   for MODEL in "${MODELS[@]}"; do
     TAG="${MODEL##*/}"
-    emit scripts/slurm/run_weights.sbatch "wgt-${TAG}" \
-      "MODEL=$MODEL"
+    emit scripts/slurm/run_weights.sbatch "wgt-${TAG}-${PROMPT_VARIANT}" \
+      "MODEL=$MODEL" "PROMPT_VARIANT=$PROMPT_VARIANT"
   done
 fi
 

@@ -173,6 +173,31 @@ class OrderProbeRow:
 
 
 @dataclass
+class InterpRow:
+    """One per (stage, model, variant[, treatment|frame]) cell."""
+    stage: str          # ablation | saliency | probing | weights
+    model: str
+    variant: str
+    treatment: str      # only for ablation; "" otherwise
+    frame: str          # "full" / "robust_winners" for saliency/probing; "" otherwise
+    out_dir: str
+    done_marker: bool
+    main_csv_rows: int  # primary output rows (ablation_results_full / saliency_summary / probing_results / logit_lens)
+    main_csv_size: int
+    rw_csv_rows: int    # only meaningful for ablation/saliency, else 0
+
+
+# Treatments and frames are kept here as a small constant set; matches what
+# audit_status.py and dispatch_all.sh already iterate over.
+INTERP_TREATMENTS = [
+    "T7_source_earned", "T5_topical_comp", "T3_structured_data_new",
+    "T2a_question_headings", "T6_freshness", "T1b_stats_density",
+]
+INTERP_FRAMES = ["full", "robust_winners"]
+_FRAME_SUFFIX = {"full": "_full", "robust_winners": "_rw"}
+
+
+@dataclass
 class Snapshot:
     timestamp: str
     data_root: str
@@ -186,6 +211,7 @@ class Snapshot:
     stage_d: list[StageDInfo]
     order_probe: list[OrderProbeRow]
     order_probe_summary: dict[str, Any]
+    interp: list[InterpRow]
 
 
 # ── Collectors ───────────────────────────────────────────────────────────────
@@ -427,6 +453,67 @@ def collect_order_probe_summary(data_root: Path) -> dict[str, Any]:
     return out
 
 
+def collect_interp(variants: list[str]) -> list[InterpRow]:
+    """Walk interpretability/output/ for variant-suffixed dirs (Stage F)."""
+    out_root = REPO_ROOT / "interpretability" / "output"
+    rows: list[InterpRow] = []
+    for variant in variants:
+        for model_id in C.LLM_MODELS:
+            m = C.short_model_name(model_id)
+            # ablation: per-treatment dir
+            for t in INTERP_TREATMENTS:
+                d = out_root / f"ablation_{t}_{m}_{variant}"
+                full = d / "ablation_results_full.csv"
+                rw = d / "ablation_results_rw.csv"
+                rows.append(InterpRow(
+                    stage="ablation", model=m, variant=variant,
+                    treatment=t, frame="",
+                    out_dir=str(d),
+                    done_marker=(d / f".done_{m}_{t}").exists(),
+                    main_csv_rows=jsonl_rows(full),
+                    main_csv_size=full.stat().st_size if full.exists() else 0,
+                    rw_csv_rows=jsonl_rows(rw),
+                ))
+            # saliency: per-frame, but stored in a single per-model dir
+            for f in INTERP_FRAMES:
+                d = out_root / f"saliency_{m}_{variant}"
+                summary = d / f"saliency_summary{_FRAME_SUFFIX[f]}.csv"
+                rows.append(InterpRow(
+                    stage="saliency", model=m, variant=variant,
+                    treatment="", frame=f,
+                    out_dir=str(d),
+                    done_marker=(d / f".done_{m}_{f}").exists(),
+                    main_csv_rows=jsonl_rows(summary),
+                    main_csv_size=summary.stat().st_size if summary.exists() else 0,
+                    rw_csv_rows=0,
+                ))
+            # probing: one CSV per model (frame=both is in the same file)
+            d = out_root / f"probing_{m}_{variant}"
+            results = d / "probing_results.csv"
+            rows.append(InterpRow(
+                stage="probing", model=m, variant=variant,
+                treatment="", frame="both",
+                out_dir=str(d),
+                done_marker=(d / f".done_{m}").exists(),
+                main_csv_rows=jsonl_rows(results),
+                main_csv_size=results.stat().st_size if results.exists() else 0,
+                rw_csv_rows=0,
+            ))
+            # weights: logit_lens.csv as primary
+            d = out_root / f"weights_{m}_{variant}"
+            lens = d / "logit_lens.csv"
+            rows.append(InterpRow(
+                stage="weights", model=m, variant=variant,
+                treatment="", frame="",
+                out_dir=str(d),
+                done_marker=(d / f".done_{m}").exists(),
+                main_csv_rows=jsonl_rows(lens),
+                main_csv_size=lens.stat().st_size if lens.exists() else 0,
+                rw_csv_rows=0,
+            ))
+    return rows
+
+
 def collect_snapshot(data_root: Path, variants: list[str],
                      seeds: list[int] | None = None) -> Snapshot:
     seeds = seeds if seeds is not None else [42, 123]
@@ -443,6 +530,7 @@ def collect_snapshot(data_root: Path, variants: list[str],
         stage_d=collect_stage_d(data_root, variants),
         order_probe=collect_order_probe(data_root, variants, seeds),
         order_probe_summary=collect_order_probe_summary(data_root),
+        interp=collect_interp(variants),
     )
 
 
@@ -550,6 +638,44 @@ def print_stage_d(rows: list[StageDInfo]) -> None:
         if r.rows > 0:
             print(f"        treatments={len(r.treatments):<2d}  methods={r.methods}  "
                   f"learners={r.learners}  subsets={len(r.subsets)}")
+
+
+def print_interp(rows: list[InterpRow], variants: list[str]) -> None:
+    """Stage F — ablation, saliency, probing, weights, per variant."""
+    n_per_var = (
+        len(C.LLM_MODELS) * len(INTERP_TREATMENTS)        # ablation
+        + len(C.LLM_MODELS) * len(INTERP_FRAMES)          # saliency
+        + len(C.LLM_MODELS)                               # probing
+        + len(C.LLM_MODELS)                               # weights
+    )
+    header(f"Stage F — interpretability   "
+           f"({n_per_var} cells × {len(variants)} variant(s) "
+           f"= {n_per_var * len(variants)} jobs)")
+
+    by_stage: dict[str, list[InterpRow]] = {}
+    for r in rows:
+        by_stage.setdefault(r.stage, []).append(r)
+
+    for stage in ("ablation", "saliency", "probing", "weights"):
+        sr = by_stage.get(stage, [])
+        n_done = sum(1 for r in sr if r.main_csv_rows > 0)
+        n_total = len(sr)
+        n_done_marker = sum(1 for r in sr if r.done_marker)
+        print(f"  {stage:<10s}  cells with CSVs={n_done:>3d}/{n_total:<3d}   "
+              f"done-markers={n_done_marker:>3d}")
+        for variant in variants:
+            sub = [r for r in sr if r.variant == variant]
+            if not sub:
+                continue
+            done_v = sum(1 for r in sub if r.main_csv_rows > 0)
+            marker_v = sum(1 for r in sub if r.done_marker)
+            tag = (col("OK ", GREEN) if done_v == len(sub)
+                   else col("PRT", YELLOW) if done_v > 0
+                   else col(" - ", DIM))
+            # Include the headline row count for the largest cell
+            top_rows = max((r.main_csv_rows for r in sub), default=0)
+            print(f"             [{variant:<8s}] {tag} cells={done_v:>2d}/{len(sub):<2d} "
+                  f"  markers={marker_v:>2d}/{len(sub):<2d}   max_rows={top_rows}")
 
 
 def print_order_probe(rows: list[OrderProbeRow], variants: list[str],
@@ -730,6 +856,32 @@ def compare_snapshots(before: dict, after: dict) -> None:
         if not any_change:
             print(col("  no change", DIM))
 
+    # Stage F — interp
+    header("Stage F — interpretability changes")
+    def _ikey(r: dict) -> tuple:
+        return (r["stage"], r["model"], r["variant"], r.get("treatment", ""),
+                r.get("frame", ""))
+    bmapF = {_ikey(r): r for r in before.get("interp", [])}
+    amapF = {_ikey(r): r for r in after.get("interp", [])}
+    any_change = False
+    for k in sorted(set(bmapF) | set(amapF)):
+        b = bmapF.get(k, {"main_csv_rows": 0, "done_marker": False})
+        a = amapF.get(k, {"main_csv_rows": 0, "done_marker": False})
+        if b["main_csv_rows"] != a["main_csv_rows"] or b["done_marker"] != a["done_marker"]:
+            any_change = True
+            stage, model, variant, t, f = k
+            tag = f"{stage}/{model[:18]}/{variant}"
+            if t:
+                tag += f"/{t}"
+            elif f and stage != "probing":
+                tag += f"/{f}"
+            marker = ""
+            if b["done_marker"] != a["done_marker"]:
+                marker = "  done={}→{}".format(b["done_marker"], a["done_marker"])
+            print(f"  {tag:<60s}  rows {_diff_count(b['main_csv_rows'], a['main_csv_rows'])}{marker}")
+    if not any_change:
+        print(col("  no change", DIM))
+
     # Order probe
     header("Stage A' — order probe changes")
     bmap4 = {(r["model"], r["engine"], r["pool"], r["variant"], r["seed"]): r
@@ -832,6 +984,7 @@ def main() -> int:
     if seeds_used:
         print_order_probe(snap.order_probe, variants, seeds_used)
         print_order_probe_summary(snap.order_probe_summary)
+    print_interp(snap.interp, variants)
 
     # Final summary line
     sa_done = sum(1 for r in snap.stage_a if r.keywords > 0)
@@ -844,12 +997,15 @@ def main() -> int:
     sd_total = len(snap.stage_d)
     op_done = sum(1 for r in snap.order_probe if r.keywords > 0)
     op_total = len(snap.order_probe)
+    f_done = sum(1 for r in snap.interp if r.main_csv_rows > 0)
+    f_total = len(snap.interp)
 
     header("Summary")
     print(f"  Stage A   {sa_done:>2d}/{sa_total:<2d}   "
           f"Stage B  {sb_done:>2d}/{sb_total:<2d}   "
           f"Stage C  {sc_done:>2d}/{sc_total:<2d}   "
           f"Stage D  {sd_done:>2d}/{sd_total:<2d}   "
+          f"Stage F  {f_done:>2d}/{f_total:<2d}   "
           f"Order probe  {op_done:>2d}/{op_total:<2d}")
     return 0
 

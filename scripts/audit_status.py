@@ -2,19 +2,22 @@
 """Audit pipeline status: per-cell completion, queue state, post-processing.
 
 Walks interpretability/output/ and prints, stage by stage:
-  - which (model x treatment) and (model x frame) cells finished
-    (`.done_*` marker present), how big the output CSVs are
+  - which (model x treatment x variant) and (model x frame x variant) cells
+    finished (`.done_*` marker present), how big the output CSVs are
   - which corresponding SLURM jobs are still queued or running
   - whether post-processing (merged ablation CSVs, figures) exists
   - one overall progress percentage
 
 Run from the repo root:
-    python scripts/audit_status.py
+    python scripts/audit_status.py                    # both variants
+    python scripts/audit_status.py --variant biased
+    python scripts/audit_status.py --variant neutral
 
 Lives at scripts/audit_status.py so it ships with the pipeline.
 """
 from __future__ import annotations
 
+import argparse
 import os
 import shutil
 import subprocess
@@ -38,6 +41,7 @@ TREATMENTS = [
     "T1b_stats_density",
 ]
 FRAMES = ["full", "robust_winners"]
+VARIANTS_DEFAULT = ["biased", "neutral"]
 
 PLOTS = [
     "figure_a_ablation_full.png",
@@ -46,6 +50,22 @@ PLOTS = [
     "figure_b_saliency_rw.png",
     "figure_c_probing.png",
 ]
+
+
+def _ablation_dir(t: str, m: str, variant: str) -> Path:
+    return OUT / f"ablation_{t}_{m}_{variant}"
+
+
+def _saliency_dir(m: str, variant: str) -> Path:
+    return OUT / f"saliency_{m}_{variant}"
+
+
+def _probing_dir(m: str, variant: str) -> Path:
+    return OUT / f"probing_{m}_{variant}"
+
+
+def _weights_dir(m: str, variant: str) -> Path:
+    return OUT / f"weights_{m}_{variant}"
 
 
 # ---------- helpers ----------------------------------------------------------
@@ -142,103 +162,112 @@ def header(text: str) -> None:
 
 # ---------- stage audits -----------------------------------------------------
 
-def audit_ablation(q: QueueState) -> tuple[int, int]:
-    header(f"Ablation  ({len(MODELS)} models x {len(TREATMENTS)} treatments = "
-           f"{len(MODELS) * len(TREATMENTS)} jobs)")
-    print(f"  {'treatment':<24s}", end="")
-    for m in MODELS:
-        print(f"  {m[:18]:<18s}", end="")
-    print()
+def audit_ablation(q: QueueState, variants: list[str]) -> tuple[int, int]:
+    n_cells = len(MODELS) * len(TREATMENTS)
+    header(f"Ablation  ({len(MODELS)} models x {len(TREATMENTS)} treatments x "
+           f"{len(variants)} variant(s) = {n_cells * len(variants)} jobs)")
 
     done_n = 0
     total = 0
-    for t in TREATMENTS:
-        print(f"  {t:<24s}", end="")
+    for variant in variants:
+        print(c(f"  [{variant}]", BOLD))
+        print(f"    {'treatment':<24s}", end="")
         for m in MODELS:
-            total += 1
-            outdir = OUT / f"ablation_{t}_{m}"
-            done = (outdir / f".done_{m}_{t}").exists()
-            full = outdir / "ablation_results_full.csv"
-            rw = outdir / "ablation_results_rw.csv"
-            ok = full.exists() and rw.exists()
-            qstr = q.status_for(f"abl-{m}-{t}")
-            tag = cell(done, qstr, ok=ok)
-            if done and ok:
-                done_n += 1
-            detail = f"f={rows(full):>5d} r={rows(rw):>5d}"
-            print(f"  {tag} {detail:<14s}", end="")
+            print(f"  {m[:18]:<18s}", end="")
         print()
+        for t in TREATMENTS:
+            print(f"    {t:<24s}", end="")
+            for m in MODELS:
+                total += 1
+                outdir = _ablation_dir(t, m, variant)
+                done = (outdir / f".done_{m}_{t}").exists()
+                full = outdir / "ablation_results_full.csv"
+                rw = outdir / "ablation_results_rw.csv"
+                ok = full.exists() and rw.exists()
+                qstr = q.status_for(f"abl-{m}-{t}-{variant}")
+                tag = cell(done, qstr, ok=ok)
+                if done and ok:
+                    done_n += 1
+                detail = f"f={rows(full):>5d} r={rows(rw):>5d}"
+                print(f"  {tag} {detail:<14s}", end="")
+            print()
     return done_n, total
 
 
-def audit_saliency(q: QueueState) -> tuple[int, int]:
-    header(f"Saliency  ({len(MODELS)} models x {len(FRAMES)} frames = "
-           f"{len(MODELS) * len(FRAMES)} jobs)")
-    print(f"  {'frame':<18s}", end="")
-    for m in MODELS:
-        print(f"  {m[:24]:<24s}", end="")
-    print()
-
+def audit_saliency(q: QueueState, variants: list[str]) -> tuple[int, int]:
+    n_cells = len(MODELS) * len(FRAMES)
+    header(f"Saliency  ({len(MODELS)} models x {len(FRAMES)} frames x "
+           f"{len(variants)} variant(s) = {n_cells * len(variants)} jobs)")
     suffix = {"full": "_full", "robust_winners": "_rw"}
     done_n = 0
     total = 0
-    for f in FRAMES:
-        print(f"  {f:<18s}", end="")
+    for variant in variants:
+        print(c(f"  [{variant}]", BOLD))
+        print(f"    {'frame':<18s}", end="")
+        for m in MODELS:
+            print(f"  {m[:24]:<24s}", end="")
+        print()
+        for f in FRAMES:
+            print(f"    {f:<18s}", end="")
+            for m in MODELS:
+                total += 1
+                outdir = _saliency_dir(m, variant)
+                done = (outdir / f".done_{m}_{f}").exists()
+                scores = outdir / f"saliency_scores{suffix[f]}.csv"
+                summary = outdir / f"saliency_summary{suffix[f]}.csv"
+                ok = scores.exists() and summary.exists()
+                qstr = q.status_for(f"sal-{m}-{f}-{variant}")
+                tag = cell(done, qstr, ok=ok)
+                if done and ok:
+                    done_n += 1
+                detail = f"sc={rows(scores):>6d} sm={rows(summary):>3d}"
+                print(f"  {tag} {detail:<20s}", end="")
+            print()
+    return done_n, total
+
+
+def audit_probing(q: QueueState, variants: list[str]) -> tuple[int, int]:
+    header(f"Probing  ({len(MODELS)} models x {len(variants)} variant(s), frame=both)")
+    done_n = 0
+    total = 0
+    for variant in variants:
+        print(c(f"  [{variant}]", BOLD))
         for m in MODELS:
             total += 1
-            outdir = OUT / f"saliency_{m}"
-            done = (outdir / f".done_{m}_{f}").exists()
-            scores = outdir / f"saliency_scores{suffix[f]}.csv"
-            summary = outdir / f"saliency_summary{suffix[f]}.csv"
-            ok = scores.exists() and summary.exists()
-            qstr = q.status_for(f"sal-{m}-{f}")
+            outdir = _probing_dir(m, variant)
+            done = (outdir / f".done_{m}").exists()
+            results = outdir / "probing_results.csv"
+            ok = results.exists()
+            qstr = q.status_for(f"prob-{m}-{variant}")
             tag = cell(done, qstr, ok=ok)
             if done and ok:
                 done_n += 1
-            detail = f"sc={rows(scores):>6d} sm={rows(summary):>3d}"
-            print(f"  {tag} {detail:<20s}", end="")
-        print()
+            n = rows(results)
+            # Expected ≈ 32 layers * 4 treatments * 2 pooling * 2 frames = 512
+            progress = f"{n:>4d}/512" if n else "    -"
+            print(f"    {m:<28s}  {tag}  rows={progress}  ({size_h(results)})")
     return done_n, total
 
 
-def audit_probing(q: QueueState) -> tuple[int, int]:
-    header(f"Probing  ({len(MODELS)} models, frame=both)")
+def audit_weights(q: QueueState, variants: list[str]) -> tuple[int, int]:
+    header(f"Weight analysis  ({len(MODELS)} models x {len(variants)} variant(s))")
     done_n = 0
     total = 0
-    for m in MODELS:
-        total += 1
-        outdir = OUT / f"probing_{m}"
-        done = (outdir / f".done_{m}").exists()
-        results = outdir / "probing_results.csv"
-        ok = results.exists()
-        qstr = q.status_for(f"prob-{m}")
-        tag = cell(done, qstr, ok=ok)
-        if done and ok:
-            done_n += 1
-        n = rows(results)
-        # Expected ≈ 32 layers * 4 treatments * 2 pooling * 2 frames = 512
-        progress = f"{n:>4d}/512" if n else "    -"
-        print(f"  {m:<28s}  {tag}  rows={progress}  ({size_h(results)})")
-    return done_n, total
-
-
-def audit_weights(q: QueueState) -> tuple[int, int]:
-    header(f"Weight analysis  ({len(MODELS)} models)")
-    done_n = 0
-    total = 0
-    for m in MODELS:
-        total += 1
-        outdir = OUT / f"weights_{m}"
-        done = (outdir / f".done_{m}").exists()
-        lens = outdir / "logit_lens.csv"
-        heads = outdir / "attention_heads.csv"
-        ok = lens.exists() and heads.exists()
-        qstr = q.status_for(f"wgt-{m}")
-        tag = cell(done, qstr, ok=ok)
-        if done and ok:
-            done_n += 1
-        print(f"  {m:<28s}  {tag}  lens={rows(lens):>5d}  "
-              f"heads={rows(heads):>6d}  ({size_h(lens)} / {size_h(heads)})")
+    for variant in variants:
+        print(c(f"  [{variant}]", BOLD))
+        for m in MODELS:
+            total += 1
+            outdir = _weights_dir(m, variant)
+            done = (outdir / f".done_{m}").exists()
+            lens = outdir / "logit_lens.csv"
+            heads = outdir / "attention_heads.csv"
+            ok = lens.exists() and heads.exists()
+            qstr = q.status_for(f"wgt-{m}-{variant}")
+            tag = cell(done, qstr, ok=ok)
+            if done and ok:
+                done_n += 1
+            print(f"    {m:<28s}  {tag}  lens={rows(lens):>5d}  "
+                  f"heads={rows(heads):>6d}  ({size_h(lens)} / {size_h(heads)})")
     return done_n, total
 
 
@@ -324,19 +353,28 @@ def headline_signs() -> None:
 # ---------- main -------------------------------------------------------------
 
 def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--variant", choices=("biased", "neutral", "both"),
+                    default="both",
+                    help="Which prompt variant to audit (default: both).")
+    args = ap.parse_args()
+
     if not OUT.exists():
         print(f"no {OUT} — run from repo root after at least one job has started")
         return 1
+
+    variants = VARIANTS_DEFAULT if args.variant == "both" else [args.variant]
 
     q = QueueState.collect()
     if not q.by_name and shutil.which("squeue"):
         print(c("(no jobs in your queue)", DIM))
 
     sections = [
-        audit_ablation(q),
-        audit_saliency(q),
-        audit_probing(q),
-        audit_weights(q),
+        audit_ablation(q, variants),
+        audit_saliency(q, variants),
+        audit_probing(q, variants),
+        audit_weights(q, variants),
         audit_postprocess(),
     ]
     done = sum(d for d, _ in sections)

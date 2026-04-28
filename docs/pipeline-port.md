@@ -149,15 +149,40 @@ do **not** rerun with neutral until biased reproduction is solid.
 ./scripts/slurm/dispatch_all.sh --only features              # no-op if already done
 ./scripts/slurm/dispatch_all.sh --only dml --variant neutral
 
-# Re-run interpretability on the neutral DML outputs.
+# Re-run interpretability on the neutral DML outputs. Each stage now writes
+# to ablation_T_M_neutral/, saliency_M_neutral/, probing_M_neutral/,
+# weights_M_neutral/ — biased outputs are preserved untouched.
 ./scripts/slurm/dispatch_all.sh --only ablation --variant neutral
 ./scripts/slurm/dispatch_all.sh --only saliency --variant neutral
 ./scripts/slurm/dispatch_all.sh --only probing  --variant neutral
+./scripts/slurm/dispatch_all.sh --only weights  --variant neutral
 
-# Final figures — emits side-by-side biased+neutral plots.
+# Consolidate per-model outputs into top-level merged CSVs (per variant).
+# Writes ablation_results_full_{variant}.csv, saliency_summary_*_{variant}.csv,
+# probing_results_{variant}.csv, logit_lens_{variant}.csv, etc. For 'biased'
+# also drops a legacy un-suffixed alias so older readers keep working.
+scripts/slurm/merge_interp.sh --variant biased
+scripts/slurm/merge_interp.sh --variant neutral
+
+# Final figures — emits per-variant figures plus side-by-side biased+neutral
+# DML coefficient comparison.
 python -m interpretability.make_figures
-python scripts/audit_status.py
+python scripts/audit_status.py            # both variants by default
+python scripts/audit_pipeline.py          # full pipeline summary inc. Stage F
 ```
+
+### Migrating pre-port biased outputs
+
+If you have legacy un-suffixed `ablation_*/`, `saliency_*/`, `probing_*/`,
+`weights_*/` directories from before the variant suffix landed, rename them
+once so the new audit/figures pick them up as `biased`:
+
+```bash
+scripts/migrate_interp_outputs_to_variant.sh           # dry-run
+scripts/migrate_interp_outputs_to_variant.sh --apply   # actually move
+```
+
+Idempotent — anything already `_biased` / `_neutral` is left alone.
 
 ### One-shot orchestrator
 
