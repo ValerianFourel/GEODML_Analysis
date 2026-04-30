@@ -933,9 +933,13 @@ def compare_snapshots(before: dict, after: dict) -> None:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                   formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--variant", choices=("biased", "neutral", "both"),
-                    default="both",
-                    help="Which prompt variant to audit (default: both).")
+    ap.add_argument("--variant",
+                    choices=("biased", "neutral", "biased_passage", "neutral_passage",
+                             "both", "all"),
+                    default="all",
+                    help="Which prompt variant to audit. 'both' = biased+neutral "
+                         "(snippet-only); 'all' = the four variants including the "
+                         "passage-augmented arms (default).")
     ap.add_argument("--seeds", nargs="+", type=int, default=[42, 123],
                     help="Order-probe seeds to audit (default: 42 123).")
     ap.add_argument("--data-root", default=None,
@@ -957,7 +961,12 @@ def main() -> int:
         return 0
 
     data_root = Path(args.data_root) if args.data_root else C.DEFAULT_DATA_ROOT
-    variants = ["biased", "neutral"] if args.variant == "both" else [args.variant]
+    if args.variant == "all":
+        variants = ["biased", "neutral", "biased_passage", "neutral_passage"]
+    elif args.variant == "both":
+        variants = ["biased", "neutral"]
+    else:
+        variants = [args.variant]
 
     snap = collect_snapshot(data_root, variants, seeds=args.seeds)
 

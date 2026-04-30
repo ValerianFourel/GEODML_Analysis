@@ -139,8 +139,11 @@ def compute_summary(root: Path, variants: list[str], seeds: list[int],
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                   formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--variants", nargs="+", default=["biased", "neutral"],
-                    choices=("biased", "neutral"))
+    ap.add_argument(
+        "--variants", nargs="+",
+        default=["biased", "neutral", "biased_passage", "neutral_passage"],
+        choices=("biased", "neutral", "biased_passage", "neutral_passage"),
+    )
     ap.add_argument("--seeds", nargs="+", type=int, default=[42, 123])
     ap.add_argument("--K", nargs="+", type=int, default=[3, 5, 10])
     ap.add_argument("--data-root", default=None)

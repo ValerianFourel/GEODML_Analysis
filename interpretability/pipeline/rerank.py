@@ -56,8 +56,10 @@ from interpretability.pipeline.prompts import (
 )
 from interpretability.utils import (
     Checkpoint,
+    HTMLLoader,
     _extract_domain,
     data_root,
+    extract_passage,
     load_serp,
     make_ranker,
     parse_ranked_domains,
@@ -212,16 +214,71 @@ def rank_one_keyword(
 
 # ─── per-keyword IO ───────────────────────────────────────────────────────────
 
-def _serp_to_results(rows: pd.DataFrame) -> list[dict]:
-    """phase0 parquet rows -> the dict shape gather_data used."""
+def _serp_to_results(
+    rows: pd.DataFrame,
+    passage_map: dict[str, str] | None = None,
+) -> list[dict]:
+    """phase0 parquet rows -> the dict shape gather_data used.
+
+    When ``passage_map`` is given, each result also carries a ``passage`` field
+    looked up by URL — that's what the passage-augmented prompt variants
+    interpolate into the per-result block.
+    """
     out: list[dict] = []
     for _, r in rows.iterrows():
-        out.append({
+        url = str(r.get("url", "") or "")
+        item: dict = {
             "position": int(r["position"]),
             "title":    str(r.get("title", "") or ""),
-            "url":      str(r.get("url", "") or ""),
+            "url":      url,
             "snippet":  str(r.get("snippet", "") or ""),
-        })
+        }
+        if passage_map is not None:
+            item["passage"] = passage_map.get(url, "")
+        out.append(item)
+    return out
+
+
+def _build_passage_map(
+    serp: pd.DataFrame,
+    root: Path,
+    engine: str,
+    model_id: str,
+    pool: int,
+    top_n: int,
+    max_chars: int = 800,
+) -> dict[str, str]:
+    """One-shot trafilatura extraction for every URL in the cell.
+
+    Reads HTML from the cell-level (un-suffixed) ``run_label(...)`` cache so
+    the same html_cache is shared across all variants of (engine, model, pool).
+    """
+    cell_run_id = C.run_label(engine, model_id, pool, top_n)
+    urls = [str(u) for u in serp["url"].dropna().unique().tolist() if u]
+    print(
+        f"[rerank] passage mode: extracting body text for {len(urls):,} unique URLs "
+        f"from html_cache of {cell_run_id}",
+        flush=True,
+    )
+    out: dict[str, str] = {}
+    n_missing = 0
+    n_empty = 0
+    with HTMLLoader(cell_run_id, root=root) as loader:
+        for url in tqdm(urls, desc="extract passages"):
+            html = loader.get_html(url)
+            if html is None:
+                out[url] = ""
+                n_missing += 1
+                continue
+            passage = extract_passage(html, max_chars=max_chars)
+            out[url] = passage
+            if not passage:
+                n_empty += 1
+    print(
+        f"[rerank] passages: total={len(out):,} missing_html={n_missing:,} "
+        f"empty_extract={n_empty:,}",
+        flush=True,
+    )
     return out
 
 
@@ -271,9 +328,12 @@ def main() -> int:
                     default=os.getenv("RERANK_BACKEND", "local"),
                     help="'local' = LocalRanker on cluster GPU. 'api' = HF Inference API "
                          "(login-node only; needs HF_TOKEN).")
-    ap.add_argument("--variant", choices=("biased", "neutral"),
+    ap.add_argument("--variant",
+                    choices=("biased", "neutral", "biased_passage", "neutral_passage"),
                     default=os.getenv("PROMPT_VARIANT", "biased"),
-                    help="Prompt variant. Defaults to PROMPT_VARIANT env or 'biased'.")
+                    help="Prompt variant. Defaults to PROMPT_VARIANT env or 'biased'. "
+                         "The *_passage variants render a multi-line per-result block "
+                         "with ~800 chars of cleaned body text from the cached HTML.")
     ap.add_argument("--data-root", default=None,
                     help="Override geodml_data root (defaults to GEODML_DATA_ROOT or ./geodml_data).")
     ap.add_argument("--max-keywords", type=int, default=None,
@@ -340,6 +400,12 @@ def main() -> int:
     serp = load_serp(backend=args.engine, pool=args.pool, root=root)
     print(f"[rerank] cached SERP rows={len(serp):,} keywords={serp.keyword.nunique():,}", flush=True)
 
+    passage_map: dict[str, str] | None = None
+    if args.variant.endswith("_passage"):
+        passage_map = _build_passage_map(
+            serp, root, args.engine, args.model, args.pool, args.top_n,
+        )
+
     ranker = make_ranker(args.backend, args.model)
 
     n_done = 0
@@ -353,7 +419,7 @@ def main() -> int:
         if args.max_keywords is not None and n_done >= args.max_keywords:
             break
 
-        results = _serp_to_results(g)
+        results = _serp_to_results(g, passage_map=passage_map)
 
         try:
             rec = rank_one_keyword(

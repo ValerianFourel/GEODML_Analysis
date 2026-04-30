@@ -51,7 +51,7 @@ FRAMES=(full robust_winners)
 ENGINES=(searxng ddg)
 POOLS=(20 50)
 SEEDS=(42 123)
-ORDER_PROBE_VARIANTS=(biased neutral)
+ORDER_PROBE_VARIANTS=(biased neutral biased_passage neutral_passage)
 
 DRY_RUN=0
 SMOKE=0

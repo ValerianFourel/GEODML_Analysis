@@ -276,7 +276,8 @@ def main() -> int:
     ap = argparse.ArgumentParser(
         description="Stage D: DoubleML PLR/IRM grid over the merged main table.",
     )
-    ap.add_argument("--variant", required=True, choices=("biased", "neutral"))
+    ap.add_argument("--variant", required=True,
+                    choices=("biased", "neutral", "biased_passage", "neutral_passage"))
     ap.add_argument("--data-root", default=None)
     ap.add_argument("--input", default=None,
                     help="Override input parquet (default: data/main/full_experiment_data_{variant}.parquet).")

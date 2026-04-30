@@ -52,7 +52,7 @@ migrate_one() {
 
     # If it already ends in _biased / _neutral / etc., skip.
     case "$base" in
-        *_biased|*_neutral) skipped+=1; return ;;
+        *_biased|*_neutral|*_biased_passage|*_neutral_passage) skipped+=1; return ;;
     esac
 
     local target="${dir}_${VARIANT}"

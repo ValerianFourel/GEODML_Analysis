@@ -49,23 +49,45 @@ def by_cell(df: pd.DataFrame, k: int) -> pd.DataFrame:
     return out
 
 
-def biased_minus_neutral(cell: pd.DataFrame) -> pd.DataFrame:
+def _pair_delta(cell: pd.DataFrame, a: str, b: str) -> pd.DataFrame:
+    """Return one row per (model, engine, pool) with Δ = a − b for jacc and oak."""
     pivot = cell.pivot_table(
         index=["model", "engine", "pool"],
         columns="variant",
         values=["mean_jacc", "mean_oak"],
     )
-    if "biased" not in pivot["mean_oak"].columns or "neutral" not in pivot["mean_oak"].columns:
+    if a not in pivot["mean_oak"].columns or b not in pivot["mean_oak"].columns:
         return pd.DataFrame()
     out = pd.DataFrame({
-        "biased_jacc":  pivot["mean_jacc"]["biased"],
-        "neutral_jacc": pivot["mean_jacc"]["neutral"],
-        "delta_jacc":   pivot["mean_jacc"]["biased"] - pivot["mean_jacc"]["neutral"],
-        "biased_oak":   pivot["mean_oak"]["biased"],
-        "neutral_oak":  pivot["mean_oak"]["neutral"],
-        "delta_oak":    pivot["mean_oak"]["biased"] - pivot["mean_oak"]["neutral"],
+        f"{a}_jacc":  pivot["mean_jacc"][a],
+        f"{b}_jacc":  pivot["mean_jacc"][b],
+        "delta_jacc": pivot["mean_jacc"][a] - pivot["mean_jacc"][b],
+        f"{a}_oak":   pivot["mean_oak"][a],
+        f"{b}_oak":   pivot["mean_oak"][b],
+        "delta_oak":  pivot["mean_oak"][a] - pivot["mean_oak"][b],
     }).round(3).reset_index().sort_values("delta_oak").reset_index(drop=True)
     return out
+
+
+def biased_minus_neutral(cell: pd.DataFrame) -> pd.DataFrame:
+    """biased − neutral, snippet-only (the original prompt-instruction effect)."""
+    return _pair_delta(cell, "biased", "neutral")
+
+
+def passage_minus_snippet(cell: pd.DataFrame, prompt: str) -> pd.DataFrame:
+    """{prompt}_passage − {prompt} (the per-prompt passage-augmentation effect).
+
+    ``prompt`` is "biased" or "neutral". A negative ``delta_oak`` means
+    passages destabilize the rerank; positive means body content makes it
+    more reproducible.
+    """
+    return _pair_delta(cell, f"{prompt}_passage", prompt)
+
+
+def biased_minus_neutral_passage(cell: pd.DataFrame) -> pd.DataFrame:
+    """biased_passage − neutral_passage (does the prompt-instruction gap survive
+    passage augmentation?)."""
+    return _pair_delta(cell, "biased_passage", "neutral_passage")
 
 
 def k_trend(df: pd.DataFrame) -> pd.DataFrame:
@@ -116,33 +138,49 @@ def main() -> int:
 
     cell = by_cell(df, args.k)
     delta = biased_minus_neutral(cell)
+    delta_biased_passage  = passage_minus_snippet(cell, "biased")
+    delta_neutral_passage = passage_minus_snippet(cell, "neutral")
+    delta_passage_prompt  = biased_minus_neutral_passage(cell)
     trend = k_trend(df)
     worst = worst_keywords(df, args.k, args.worst_n)
 
     cell_csv  = outdir / "order_probe_by_cell.csv"
     delta_csv = outdir / "order_probe_biased_minus_neutral.csv"
+    delta_bp_csv = outdir / "order_probe_biased_passage_minus_biased.csv"
+    delta_np_csv = outdir / "order_probe_neutral_passage_minus_neutral.csv"
+    delta_pp_csv = outdir / "order_probe_biased_passage_minus_neutral_passage.csv"
     trend_csv = outdir / "order_probe_k_trend.csv"
     worst_csv = outdir / "order_probe_worst_keywords.csv"
 
     cell.to_csv(cell_csv, index=False)
-    if not delta.empty:
-        delta.to_csv(delta_csv, index=False)
+    extras = (
+        ("biased − neutral",                       delta,                 delta_csv),
+        ("biased_passage − biased",                delta_biased_passage,  delta_bp_csv),
+        ("neutral_passage − neutral",              delta_neutral_passage, delta_np_csv),
+        ("biased_passage − neutral_passage",       delta_passage_prompt,  delta_pp_csv),
+    )
+    for _label, frame, path in extras:
+        if not frame.empty:
+            frame.to_csv(path, index=False)
     trend.to_csv(trend_csv, index=False)
     worst.to_csv(worst_csv, index=False)
 
     print(f"[order_probe_report] read {len(df):,} rows from {summary_path}")
     print(f"[order_probe_report] wrote {cell_csv}")
-    if not delta.empty:
-        print(f"[order_probe_report] wrote {delta_csv}")
+    for _label, frame, path in extras:
+        if not frame.empty:
+            print(f"[order_probe_report] wrote {path}")
     print(f"[order_probe_report] wrote {trend_csv}")
     print(f"[order_probe_report] wrote {worst_csv}")
 
     print(f"\n=== per-cell at K={args.k} (mean over keywords × ordering pairs) ===")
     print(cell.to_string(index=False))
 
-    if not delta.empty:
-        print("\n=== biased − neutral gap (K={}, sorted by Δ overlap@K asc) ===".format(args.k))
-        print(delta.to_string(index=False))
+    for label, frame, _path in extras:
+        if frame.empty:
+            continue
+        print(f"\n=== {label} gap (K={args.k}, sorted by Δ overlap@K asc) ===")
+        print(frame.to_string(index=False))
 
     print("\n=== K-trend (averaged over all cells of a variant) ===")
     print(trend.to_string(index=False))

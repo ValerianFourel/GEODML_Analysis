@@ -35,7 +35,8 @@ from interpretability.utils import data_root
 # ── Run-id parsing ───────────────────────────────────────────────────────────
 
 _RUN_RE = re.compile(
-    r"^(?P<engine>[^_]+)_(?P<model>.+)_serp(?P<pool>\d+)_top(?P<topn>\d+)_(?P<variant>biased|neutral)$"
+    r"^(?P<engine>[^_]+)_(?P<model>.+)_serp(?P<pool>\d+)_top(?P<topn>\d+)"
+    r"_(?P<variant>biased_passage|neutral_passage|biased|neutral)$"
 )
 
 
@@ -164,7 +165,8 @@ def main() -> int:
     ap = argparse.ArgumentParser(
         description="Stage C: merge rerank + features into full_experiment_data_{variant}.parquet",
     )
-    ap.add_argument("--variant", required=True, choices=("biased", "neutral"))
+    ap.add_argument("--variant", required=True,
+                    choices=("biased", "neutral", "biased_passage", "neutral_passage"))
     ap.add_argument("--runs", nargs="*", default=None,
                     help="Subset of run_ids to include. Default: all "
                          "{engine}_{model}_serp{pool}_top{top_n}_{variant} "

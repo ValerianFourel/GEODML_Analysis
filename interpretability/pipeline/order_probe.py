@@ -45,6 +45,7 @@ from tqdm import tqdm
 
 from interpretability.pipeline import config as C
 from interpretability.pipeline.rerank import (
+    _build_passage_map,
     _iter_keyword_groups,
     _serp_to_results,
     rank_one_keyword,
@@ -117,7 +118,8 @@ def main() -> int:
                     help="HuggingFace model ID for the local 4-bit ranker.")
     ap.add_argument("--backend", choices=("local", "api"),
                     default=os.getenv("RERANK_BACKEND", "local"))
-    ap.add_argument("--variant", choices=("biased", "neutral"),
+    ap.add_argument("--variant",
+                    choices=("biased", "neutral", "biased_passage", "neutral_passage"),
                     default=os.getenv("PROMPT_VARIANT", "biased"))
     ap.add_argument("--seed", type=int, required=True,
                     help="RNG seed for the per-keyword candidate shuffle.")
@@ -172,6 +174,12 @@ def main() -> int:
     print(f"[order_probe] cached SERP rows={len(serp):,} "
           f"keywords={serp.keyword.nunique():,}", flush=True)
 
+    passage_map: dict[str, str] | None = None
+    if args.variant.endswith("_passage"):
+        passage_map = _build_passage_map(
+            serp, root, args.engine, args.model, args.pool, args.top_n,
+        )
+
     # Ranker (mock under --smoke, real otherwise).
     ranker = _MockRanker() if args.smoke else make_ranker(args.backend, args.model)
 
@@ -188,7 +196,7 @@ def main() -> int:
         if args.max_keywords is not None and n_done >= args.max_keywords:
             break
 
-        results = _serp_to_results(g)
+        results = _serp_to_results(g, passage_map=passage_map)
         original_order = [int(r["position"]) for r in results]
         shuffled, perm = _shuffle_for_keyword(results, seed=args.seed, keyword=kw)
 

@@ -191,6 +191,42 @@ def page_digest(html: str, max_chars: int = 8000) -> str:
     return text[:max_chars]
 
 
+_PASSAGE_FALLBACK_MIN_CHARS = 100
+
+
+def extract_passage(html: str | None, max_chars: int = 800) -> str:
+    """Body-text extraction tuned for the passage-augmented rerank prompt.
+
+    Prefers `trafilatura.extract` (boilerplate stripping is markedly better on
+    blog/news pages); falls back to `page_digest` when trafilatura is missing
+    or returns too little. Replaces newlines and brackets so the result can be
+    safely interpolated into the bracketed multi-line per-result block without
+    confusing the LLM's list-parsing heuristic.
+    """
+    if not html:
+        return ""
+
+    text: str | None = None
+    try:
+        import trafilatura  # type: ignore[import-not-found]
+
+        text = trafilatura.extract(
+            html,
+            include_comments=False,
+            include_tables=False,
+            favor_recall=True,
+        )
+    except Exception:
+        text = None
+
+    if not text or len(text) < _PASSAGE_FALLBACK_MIN_CHARS:
+        text = page_digest(html, max_chars=max_chars * 2)
+
+    text = text.replace("[", "(").replace("]", ")")
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:max_chars]
+
+
 # ---------------------------------------------------------------------------
 # Re-ranking prompt (reverse-engineered from src/llm_ranker.py::_build_prompt)
 # ---------------------------------------------------------------------------

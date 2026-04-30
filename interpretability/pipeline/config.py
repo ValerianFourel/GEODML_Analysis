@@ -187,11 +187,13 @@ def run_label_with_variant(engine: str, model_id: str, serp_n: int,
                            llm_top_n: int, variant: str) -> str:
     """Run label suffixed with the prompt variant.
 
-    The neutral and biased variants must coexist on disk for side-by-side
-    comparison, so each variant gets its own run dir.
+    Variants coexist on disk for side-by-side comparison (snippet vs passage,
+    biased vs neutral). Validation is delegated to ``prompts.PromptVariant``
+    so adding a new variant only touches one place.
     """
-    if variant not in ("biased", "neutral"):
-        raise ValueError(f"variant must be 'biased' or 'neutral', got {variant!r}")
+    from interpretability.pipeline.prompts import _KNOWN_VARIANTS
+    if variant not in _KNOWN_VARIANTS:
+        raise ValueError(f"variant must be one of {_KNOWN_VARIANTS}, got {variant!r}")
     return f"{run_label(engine, model_id, serp_n, llm_top_n)}_{variant}"
 
 

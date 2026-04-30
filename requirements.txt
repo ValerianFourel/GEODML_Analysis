@@ -9,6 +9,7 @@ seaborn>=0.13
 tqdm>=4.66
 beautifulsoup4>=4.12
 lxml>=5.1
+trafilatura>=1.8
 python-dotenv>=1.0
 
 # GPU-only (install on the local GPU box; ablation.py does not need these).
