@@ -9,9 +9,11 @@ Walks interpretability/output/ and prints, stage by stage:
   - one overall progress percentage
 
 Run from the repo root:
-    python scripts/audit_status.py                    # both variants
+    python scripts/audit_status.py                    # all 4 variants
     python scripts/audit_status.py --variant biased
-    python scripts/audit_status.py --variant neutral
+    python scripts/audit_status.py --variant neutral_passage
+    python scripts/audit_status.py --variant snippet  # biased + neutral
+    python scripts/audit_status.py --variant passage  # biased_passage + neutral_passage
 
 Lives at scripts/audit_status.py so it ships with the pipeline.
 """
@@ -41,7 +43,9 @@ TREATMENTS = [
     "T1b_stats_density",
 ]
 FRAMES = ["full", "robust_winners"]
-VARIANTS_DEFAULT = ["biased", "neutral"]
+VARIANTS_DEFAULT = ["biased", "neutral", "biased_passage", "neutral_passage"]
+SNIPPET_VARIANTS = ["biased", "neutral"]
+PASSAGE_VARIANTS = ["biased_passage", "neutral_passage"]
 
 PLOTS = [
     "figure_a_ablation_full.png",
@@ -355,16 +359,26 @@ def headline_signs() -> None:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--variant", choices=("biased", "neutral", "both"),
-                    default="both",
-                    help="Which prompt variant to audit (default: both).")
+    ap.add_argument("--variant",
+                    choices=("biased", "neutral", "biased_passage",
+                             "neutral_passage", "snippet", "passage", "all"),
+                    default="all",
+                    help="Which prompt variant(s) to audit. 'snippet'=biased+neutral, "
+                         "'passage'=biased_passage+neutral_passage, 'all'=all 4 (default).")
     args = ap.parse_args()
 
     if not OUT.exists():
         print(f"no {OUT} — run from repo root after at least one job has started")
         return 1
 
-    variants = VARIANTS_DEFAULT if args.variant == "both" else [args.variant]
+    if args.variant == "all":
+        variants = VARIANTS_DEFAULT
+    elif args.variant == "snippet":
+        variants = SNIPPET_VARIANTS
+    elif args.variant == "passage":
+        variants = PASSAGE_VARIANTS
+    else:
+        variants = [args.variant]
 
     q = QueueState.collect()
     if not q.by_name and shutil.which("squeue"):

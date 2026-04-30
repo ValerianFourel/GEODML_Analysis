@@ -14,7 +14,7 @@
 #     --export=ALL,PROMPT_VARIANT=neutral \
 #     scripts/slurm/run_dml.sbatch
 
-#SBATCH --partition=batch
+#SBATCH --partition=booster
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=48
