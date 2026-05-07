@@ -14,6 +14,13 @@ Pure pandas; ~30 s on full data; no GPU; safe to run on a JUWELS login node.
 from __future__ import annotations
 
 import sys
+from pathlib import Path
+
+# Make the repo root importable so `interpretability.*` resolves regardless
+# of CWD or whether the user has set PYTHONPATH.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 from interpretability.pipeline.merge import main
 
