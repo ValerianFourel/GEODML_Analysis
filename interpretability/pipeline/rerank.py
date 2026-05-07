@@ -248,38 +248,91 @@ def _build_passage_map(
     top_n: int,
     max_chars: int = 800,
 ) -> dict[str, str]:
-    """One-shot trafilatura extraction for every URL in the cell.
+    """trafilatura extraction for every URL, cached at (engine, pool) granularity.
 
-    Reads HTML from the cell-level (un-suffixed) ``run_label(...)`` cache so
-    the same html_cache is shared across all variants of (engine, model, pool).
+    URLs come from ``phase0_top<pool>_<engine>.parquet`` which is engine+pool
+    specific but model-agnostic, so all 4 cells × {biased_passage,
+    neutral_passage} for a given (engine, pool) share the same passage map.
+    We persist it to ``data/passages/passages_<engine>_top<pool>.parquet`` so
+    the first cell run pays the extraction cost (~10-15 min for 6-8k URLs)
+    and everything after loads instantly.
+
+    HTML is read from the cell-level (un-suffixed) ``run_label(...)`` cache,
+    where the per-(engine, model, pool) html_cache lives.
     """
+    cache_dir = root / "data" / "passages"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_path = cache_dir / f"passages_{engine}_top{pool}_max{max_chars}.parquet"
+
+    cached: dict[str, str] = {}
+    if cache_path.exists():
+        try:
+            df = pd.read_parquet(cache_path)
+            cached = dict(zip(df["url"].astype(str), df["passage"].astype(str)))
+            print(
+                f"[rerank] loaded {len(cached):,} cached passages from {cache_path.name}",
+                flush=True,
+            )
+        except Exception as e:
+            print(f"[rerank] cache read failed ({e}); recomputing", flush=True)
+            cached = {}
+
     cell_run_id = C.run_label(engine, model_id, pool, top_n)
     urls = [str(u) for u in serp["url"].dropna().unique().tolist() if u]
+    todo = [u for u in urls if u not in cached]
+
+    if not todo:
+        print(
+            f"[rerank] passages: all {len(urls):,} URLs already cached",
+            flush=True,
+        )
+        return {u: cached.get(u, "") for u in urls}
+
     print(
-        f"[rerank] passage mode: extracting body text for {len(urls):,} unique URLs "
+        f"[rerank] passage mode: extracting {len(todo):,} new URLs (of {len(urls):,}) "
         f"from html_cache of {cell_run_id}",
         flush=True,
     )
-    out: dict[str, str] = {}
+    out: dict[str, str] = dict(cached)
     n_missing = 0
     n_empty = 0
+    flush_every = 200
+    n_new_since_flush = 0
+
+    def _flush():
+        try:
+            df_out = pd.DataFrame({"url": list(out.keys()), "passage": list(out.values())})
+            tmp = cache_path.with_suffix(".tmp.parquet")
+            df_out.to_parquet(tmp, index=False)
+            tmp.replace(cache_path)
+        except Exception as e:
+            print(f"[rerank] cache write failed ({e}); continuing in-memory", flush=True)
+
     with HTMLLoader(cell_run_id, root=root) as loader:
-        for url in tqdm(urls, desc="extract passages"):
+        for url in tqdm(todo, desc="extract passages"):
             html = loader.get_html(url)
             if html is None:
                 out[url] = ""
                 n_missing += 1
-                continue
-            passage = extract_passage(html, max_chars=max_chars)
-            out[url] = passage
-            if not passage:
-                n_empty += 1
+            else:
+                passage = extract_passage(html, max_chars=max_chars)
+                out[url] = passage
+                if not passage:
+                    n_empty += 1
+            n_new_since_flush += 1
+            if n_new_since_flush >= flush_every:
+                _flush()
+                n_new_since_flush = 0
+    if n_new_since_flush > 0:
+        _flush()
+
     print(
-        f"[rerank] passages: total={len(out):,} missing_html={n_missing:,} "
-        f"empty_extract={n_empty:,}",
+        f"[rerank] passages: total={len(urls):,} new={len(todo):,} "
+        f"missing_html={n_missing:,} empty_extract={n_empty:,}  "
+        f"cache → {cache_path.name}",
         flush=True,
     )
-    return out
+    return {u: out.get(u, "") for u in urls}
 
 
 def _iter_keyword_groups(serp: pd.DataFrame, pool: int) -> Iterable[tuple[str, pd.DataFrame]]:
