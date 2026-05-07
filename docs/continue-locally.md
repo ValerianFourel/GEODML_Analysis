@@ -120,9 +120,63 @@ The script is **idempotent** — re-running skips any (engine, pool) or
 FORCE=1 bash scripts/continue_pipeline.sh
 ```
 
+## After the run — packaging & upload
+
+The script's last steps automatically:
+
+1. **Zip the new artifacts** into
+   `archives/local_results_<date>-<hhmm>.zip`. The zip contains:
+   - `geodml_data/data/features/` — Stage B parquets
+   - `geodml_data/data/main/` — Stage C merged tables
+   - `geodml_data/data/dml_results/` — Stage D long tables
+   - `interpretability/output/plots/` — regenerated paper figures
+   - `PROVENANCE.txt` — git commit, host, date, and the LLM config in
+     effect (`temperature=0.1`, `max_tokens=500`) so future readers can
+     verify these results were generated with the same settings as the
+     cluster runs.
+
+2. **Print the upload command** ready to copy/paste — e.g.:
+   ```bash
+   huggingface-cli login
+   hf upload ValerianFourel/geodml-papersize \
+     archives/local_results_20260507-1530.zip \
+     archives/local_results_20260507-1530.zip \
+     --repo-type dataset \
+     --commit-message "local Stage B/C/D 20260507-1530"
+   ```
+   Single-file commit → no 500 errors regardless of size.
+
+The script does **not** auto-upload — you review the zip first, then run
+the printed command with a write-scoped token.
+
+## Stage F is a separate step (not in this script)
+
+Stage F is 74/80 already; the 6 missing cells are all probing
+(neutral, biased_passage, neutral_passage × {Llama, Qwen}). Probing
+needs raw 70B-model hidden states (`output_hidden_states=True`), which no
+inference API exposes — it has to run on a GPU box with the weights
+loaded.
+
+**On JUWELS:**
+```bash
+# 6 cells = 2 models × 3 variants. ~4–10 h wall on 4×A100-40G each.
+for MODEL in meta-llama/Llama-3.3-70B-Instruct Qwen/Qwen2.5-72B-Instruct; do
+  for V in neutral biased_passage neutral_passage; do
+    sbatch --account=$JUWELS_ACCOUNT \
+      --export=ALL,MODEL=$MODEL,PROMPT_VARIANT=$V \
+      scripts/slurm/run_probing.sbatch
+  done
+done
+```
+
+Once those land, re-run `audit_pipeline.py` on JUWELS to confirm
+Stage F is 80/80, then re-package and upload (same script, just from
+JUWELS this time). The local Stage B/C/D results from this guide are
+unaffected by Stage F finishing.
+
 ## What you should see at the end
 
-The audit at the bottom of the run should show:
+The audit at the bottom of the local run should show:
 
 ```
 Stage A   24/32   Stage B   2/4    Stage C   4/4    Stage D   4/4    Stage F  74/80   Order probe  48/64

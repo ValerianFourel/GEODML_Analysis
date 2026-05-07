@@ -82,6 +82,24 @@ echo "  GEODML_DATA_ROOT = $GEODML_DATA_ROOT"
 [ -d "$GEODML_DATA_ROOT/data/serp" ] || { fail "no $GEODML_DATA_ROOT/data/serp — wrong path?"; exit 2; }
 [ -d "$GEODML_DATA_ROOT/data/runs" ] || { fail "no $GEODML_DATA_ROOT/data/runs — wrong path?"; exit 2; }
 
+# Lock in the same LLM config the cluster used. The local pipeline is B/C/D
+# only (deterministic), but if any rerank-style step is re-invoked later,
+# config.py is the single source of truth — and these values must match the
+# cluster runs (temperature=0.1, max_tokens=500) for results to be comparable.
+LLM_CFG=$(python -c "
+from interpretability.pipeline import config as C
+print(f'{C.LLM_TEMPERATURE}|{C.LLM_MAX_TOKENS}')
+")
+LLM_TEMP=${LLM_CFG%%|*}
+LLM_TOKS=${LLM_CFG##*|}
+echo "  LLM config       = temperature=${LLM_TEMP}, max_tokens=${LLM_TOKS} (matches cluster)"
+if [ "$LLM_TEMP" != "0.1" ] || [ "$LLM_TOKS" != "500" ]; then
+  fail "config.py drifted from cluster values (expected 0.1 / 500). Aborting."
+  exit 2
+fi
+echo "  Stages B/C/D are deterministic (no LLM call). Temperature is preserved"
+echo "  for any future rerank re-run via config.py."
+
 step "Stage B — features (variant-agnostic)"
 B_done=0; B_skip=0
 for engine in "${ENGINES_ARR[@]}"; do
@@ -165,4 +183,85 @@ if [ -z "$SKIP_FIGURES" ]; then
 fi
 
 step "Audit (after)"
-python scripts/audit_pipeline.py
+python scripts/audit_pipeline.py | tee /tmp/audit_after.txt
+
+step "Package results for upload"
+DATE=$(date +%Y%m%d-%H%M)
+ARCHIVES_DIR="$REPO_ROOT/archives"
+mkdir -p "$ARCHIVES_DIR"
+RESULT_ZIP="$ARCHIVES_DIR/local_results_${DATE}.zip"
+
+# Stage only what this run produced — feature parquets, main tables, DML
+# results, and freshly regenerated figures. NOT the full geodml_data dump
+# (that was already uploaded as geodml_data_.zip).
+TMP_STAGE=$(mktemp -d)
+trap 'rm -rf "$TMP_STAGE"' EXIT
+
+mkdir -p "$TMP_STAGE/geodml_data/data"
+for sub in features main dml_results; do
+  src="$GEODML_DATA_ROOT/data/$sub"
+  if [ -d "$src" ]; then
+    cp -R "$src" "$TMP_STAGE/geodml_data/data/"
+  fi
+done
+
+if [ -d "$REPO_ROOT/interpretability/output/plots" ]; then
+  mkdir -p "$TMP_STAGE/interpretability/output"
+  cp -R "$REPO_ROOT/interpretability/output/plots" \
+        "$TMP_STAGE/interpretability/output/"
+fi
+
+cat > "$TMP_STAGE/PROVENANCE.txt" <<PROV
+GEODML local Stage B/C/D results bundle
+========================================
+generated:        $(date -u +%Y-%m-%dT%H:%M:%SZ)
+host:             $(hostname)
+user:             ${USER:-unknown}
+git:              $(git -C "$REPO_ROOT" log -1 --pretty=format:'%h %s' 2>/dev/null || echo 'n/a')
+
+Pipeline config (matches cluster runs):
+  LLM_TEMPERATURE = ${LLM_TEMP}
+  LLM_MAX_TOKENS  = ${LLM_TOKS}
+  source:           interpretability/pipeline/config.py
+
+Contents:
+  geodml_data/data/features/    - Stage B parquets (variant-agnostic)
+  geodml_data/data/main/        - Stage C merged main tables (per variant)
+  geodml_data/data/dml_results/ - Stage D DML long tables (per variant)
+  interpretability/output/plots/- regenerated paper figures
+
+NOT included (already on the Hub):
+  geodml_data/data/runs/*       - cluster rerank/order-probe outputs
+  geodml_data/data/serp/*       - SERP inputs
+  interpretability/output/      - Stage F per-cell CSVs (ablation, saliency,
+                                  weights, probing 2/8) — already uploaded
+                                  in interpretability_.zip
+
+Stage F next steps (separate, GPU-only on JUWELS):
+  6 missing probing cells (neutral, biased_passage, neutral_passage × Llama
+  + Qwen). Probing extracts per-layer hidden states from the 70B model;
+  forward-only but cannot run via inference API. Submit on JUWELS:
+    sbatch --account=\$JUWELS_ACCOUNT --export=ALL,MODEL=meta-llama/Llama-3.3-70B-Instruct,PROMPT_VARIANT=neutral scripts/slurm/run_probing.sbatch
+  ...repeated for the 6 missing (model × variant) combos.
+PROV
+
+( cd "$TMP_STAGE" && zip -qr "$RESULT_ZIP" . )
+ok "wrote $(du -h "$RESULT_ZIP" | cut -f1) -> $RESULT_ZIP"
+
+step "Upload command (review before running)"
+cat <<UPLOAD
+  # Push this run's results to the HF dataset (requires WRITE-scoped token):
+  huggingface-cli login    # one-time, paste a write token
+  hf upload ValerianFourel/geodml-papersize \\
+    "$RESULT_ZIP" \\
+    "archives/local_results_${DATE}.zip" \\
+    --repo-type dataset \\
+    --commit-message "local Stage B/C/D ${DATE}"
+UPLOAD
+
+step "What's left"
+cat <<NEXT
+  - Stage F probing: 6 cells × ≤24 h on 4×A100-40G each. JUWELS only.
+    See PROVENANCE.txt inside $RESULT_ZIP for the sbatch invocation.
+  - All other stages: complete in this snapshot.
+NEXT
