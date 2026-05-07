@@ -116,7 +116,7 @@ def main() -> int:
     ap.add_argument("--model",
                     default=os.getenv("PRIMARY_MODEL", C.LLM_MODELS[0]),
                     help="HuggingFace model ID for the local 4-bit ranker.")
-    ap.add_argument("--backend", choices=("local", "api"),
+    ap.add_argument("--backend", choices=("local", "api", "openai"),
                     default=os.getenv("RERANK_BACKEND", "local"))
     ap.add_argument("--variant",
                     choices=("biased", "neutral", "biased_passage", "neutral_passage"),

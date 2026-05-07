@@ -324,7 +324,7 @@ def main() -> int:
     ap.add_argument("--model",
                     default=os.getenv("PRIMARY_MODEL", C.LLM_MODELS[0]),
                     help="HuggingFace model ID for the local 4-bit ranker.")
-    ap.add_argument("--backend", choices=("local", "api"),
+    ap.add_argument("--backend", choices=("local", "api", "openai"),
                     default=os.getenv("RERANK_BACKEND", "local"),
                     help="'local' = LocalRanker on cluster GPU. 'api' = HF Inference API "
                          "(login-node only; needs HF_TOKEN).")

@@ -455,10 +455,75 @@ class LocalRanker:
         return self.tok.decode(gen, skip_special_tokens=True)
 
 
-def make_ranker(backend: str, model: str) -> "InferenceRanker | LocalRanker":
-    """Factory. backend ∈ {'api', 'local'}."""
+class OpenAIRanker:
+    """Online: OpenAI-compatible chat completions API.
+
+    Use for providers that expose the OpenAI schema at a custom base_url —
+    DeepInfra, Together AI, Fireworks, Groq, Anyscale, etc. Picked instead of
+    ``InferenceRanker`` (HuggingFace serverless) when LLAMA-class / Qwen-72B
+    models aren't reliably hosted on HF or are gated.
+
+    Required env:
+      OPENAI_API_KEY    provider API key
+      OPENAI_BASE_URL   e.g. https://api.deepinfra.com/v1/openai
+                          or https://api.together.xyz/v1
+                          or https://api.fireworks.ai/inference/v1
+
+    Optional env:
+      OPENAI_MODEL_OVERRIDE  if the provider's model id differs from HF's
+                             (e.g. "Qwen/Qwen2.5-72B-Instruct-Turbo" on Together)
+    """
+
+    def __init__(self, model: str, max_retries: int = 4):
+        try:
+            from openai import OpenAI
+        except ImportError as e:
+            raise ImportError(
+                "openai package required for OpenAIRanker. "
+                "Install with: pip install openai"
+            ) from e
+        api_key = os.getenv("OPENAI_API_KEY")
+        base_url = os.getenv("OPENAI_BASE_URL")
+        if not api_key or not base_url:
+            raise RuntimeError(
+                "OpenAIRanker needs OPENAI_API_KEY and OPENAI_BASE_URL env vars."
+            )
+        self.client = OpenAI(api_key=api_key, base_url=base_url)
+        self.model = os.getenv("OPENAI_MODEL_OVERRIDE", model)
+        self.max_retries = max_retries
+
+    def rank(self, prompt: str, max_tokens: int = 500, temperature: float = 0.1) -> str:
+        last_err: Exception | None = None
+        for attempt in range(self.max_retries):
+            try:
+                resp = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[{"role": "user", "content": prompt}],
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                )
+                return resp.choices[0].message.content or ""
+            except Exception as e:
+                last_err = e
+                sleep = min(60, 2 ** attempt)
+                time.sleep(sleep)
+        raise RuntimeError(
+            f"OpenAI-compatible inference failed after {self.max_retries} retries: {last_err}"
+        )
+
+
+def make_ranker(backend: str, model: str) -> "InferenceRanker | LocalRanker | OpenAIRanker":
+    """Factory. backend ∈ {'api', 'local', 'openai'}.
+
+    'api'    -> HuggingFace serverless (InferenceClient)
+    'openai' -> OpenAI-compatible provider (DeepInfra/Together/Fireworks/...)
+                via OPENAI_BASE_URL + OPENAI_API_KEY
+    'local'  -> load weights locally (CUDA preferred)
+    """
     if backend == "api":
         return InferenceRanker(model=model)
+    if backend == "openai":
+        return OpenAIRanker(model=model)
     if backend == "local":
         return LocalRanker(model=model)
     raise ValueError(f"unknown backend: {backend}")
