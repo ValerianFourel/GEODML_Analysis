@@ -116,9 +116,16 @@ def load_run_keywords(run_id: str, root: str | Path | None = None) -> Iterable[d
 # ---------------------------------------------------------------------------
 
 def url_to_html_filename(url: str) -> str:
-    """Convention used by the original pipeline: md5(url)[:16] + '.html'."""
-    # NB: upstream paperSizeExperiment used SHA-256 for cache filenames
-    # (see GEODML/pipeline/gather_data.py:_url_to_cache_key). Must match.
+    """Convention used by the upstream paperSizeExperiment pipeline:
+    sha256(url)[:16] + '.html'.
+
+    Must match exactly what the scraper wrote — see
+    ``GEODML/pipeline/gather_data.py:_url_to_cache_key`` (and identical
+    definitions in extract_features.py, rebuild_features.py,
+    fill_confounders.py, save_phase2_progress.py, export_html_cache.py,
+    earned_media_halo.py). Don't change this without re-renaming all
+    cached files.
+    """
     return hashlib.sha256(url.encode()).hexdigest()[:16] + ".html"
 
 
