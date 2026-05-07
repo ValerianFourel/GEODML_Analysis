@@ -46,18 +46,39 @@ ACCEPT = (
     "image/avif,image/webp,*/*;q=0.8"
 )
 
+# Fuller header set used in --retry-mode. Mimics what a real Chrome browser
+# sends, including Sec-Fetch-* and Sec-Ch-Ua-* headers that some bot detectors
+# look for.
+RETRY_HEADERS_BASE = {
+    "User-Agent": UA,
+    "Accept": ACCEPT,
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Cache-Control": "max-age=0",
+    "Sec-Ch-Ua": '"Google Chrome";v="120", "Chromium";v="120", "Not?A_Brand";v="24"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"macOS"',
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
+    "Connection": "keep-alive",
+}
+
 
 def url_hash(url: str) -> str:
     return hashlib.sha256(url.encode()).hexdigest()[:16]
 
 
-def fetch(url: str, timeout: float) -> tuple[str | None, str | None]:
+def fetch(url: str, timeout: float, retry_mode: bool = False) -> tuple[str | None, str | None]:
+    headers = RETRY_HEADERS_BASE if retry_mode else {
+        "User-Agent": UA, "Accept": ACCEPT, "Accept-Language": "en-US,en;q=0.9",
+    }
     try:
         r = requests.get(
-            url,
-            headers={"User-Agent": UA, "Accept": ACCEPT, "Accept-Language": "en-US,en;q=0.9"},
-            timeout=timeout,
-            allow_redirects=True,
+            url, headers=headers, timeout=timeout, allow_redirects=True,
+            verify=not retry_mode,  # in retry mode, accept dodgy certs (recovers SSL errors)
         )
         if r.status_code != 200:
             return None, f"http_{r.status_code}"
@@ -66,7 +87,6 @@ def fetch(url: str, timeout: float) -> tuple[str | None, str | None]:
             return None, f"not_html"
         if len(r.text) < 300:
             return None, "too_small"
-        # Cap absurdly large pages
         return r.text[:8_000_000], None
     except requests.exceptions.Timeout:
         return None, "timeout"
@@ -95,6 +115,9 @@ def main() -> int:
                     help="Cap total URLs (smoke test)")
     ap.add_argument("--dry-run", action="store_true",
                     help="Inventory only, don't fetch")
+    ap.add_argument("--retry-mode", action="store_true",
+                    help="Aggressive retry settings: fuller browser headers (Sec-Fetch-*), "
+                         "30s timeout default, per-host throttling, accept dodgy SSL.")
     args = ap.parse_args()
 
     root = Path(args.data_root).resolve()
@@ -210,9 +233,30 @@ def main() -> int:
     reasons: dict[str, int] = {}
     started = time.time()
 
+    # In retry mode, bump default timeout and throttle per-host to avoid
+    # tripping the bot detectors that just rejected us last time.
+    timeout = args.timeout
+    if args.retry_mode and timeout < 30:
+        timeout = 30.0
+
+    # Per-host throttling — don't hammer the same domain
+    from collections import defaultdict
+    from threading import Lock
+    from urllib.parse import urlparse
+    host_locks: dict[str, Lock] = defaultdict(Lock)
+    host_last_ts: dict[str, float] = defaultdict(float)
+    PER_HOST_DELAY = 0.5 if args.retry_mode else 0.0
+
     def do_one(item: tuple[str, list[Path]]):
         url, dirs = item
-        html, err = fetch(url, timeout=args.timeout)
+        if PER_HOST_DELAY > 0:
+            host = urlparse(url).netloc
+            with host_locks[host]:
+                wait = host_last_ts[host] + PER_HOST_DELAY - time.time()
+                if wait > 0:
+                    time.sleep(wait)
+                host_last_ts[host] = time.time()
+        html, err = fetch(url, timeout=timeout, retry_mode=args.retry_mode)
         if html is None:
             return False, url, err
         fname = url_hash(url) + ".html"
@@ -223,7 +267,9 @@ def main() -> int:
                 return False, url, f"write_{type(e).__name__}"
         return True, url, None
 
-    print(f"\nfetching {len(work):,} URLs with {args.workers} workers ({args.timeout}s timeout)…")
+    mode_label = "RETRY MODE" if args.retry_mode else "normal"
+    print(f"\nfetching {len(work):,} URLs with {args.workers} workers "
+          f"({timeout}s timeout, {mode_label})…")
     with ThreadPoolExecutor(max_workers=args.workers) as ex:
         futures = [ex.submit(do_one, w) for w in work]
         for i, fut in enumerate(as_completed(futures)):
