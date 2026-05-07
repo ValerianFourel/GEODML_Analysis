@@ -198,91 +198,104 @@ else
 fi
 echo "  summary: linked=$linked, already=$already, missing=$missing"
 
-# ── Phase 2: rerank — 8 cells (ddg × {pool=20, pool=50} × passage × 2 models)
-if [ -z "${SKIP_RERANK:-}" ]; then
-  step "Rerank — 8 missing ddg×passage cells via OpenAI-compatible API"
-  for SPEC in "Llama-3.3-70B-Instruct|$LLAMA_HF_ID|$LLAMA_API_ID" \
-              "Qwen2.5-72B-Instruct|$QWEN_HF_ID|$QWEN_API_ID"; do
-    IFS='|' read -r TAG HF_ID API_ID <<<"$SPEC"
-    for POOL in 20 50; do
-      for V in biased_passage neutral_passage; do
-        cell_label="${TAG}/pool=${POOL}/${V}"
-        # Verify HTML is reachable for this cell
-        HTML_DIR="$GEODML_DATA_ROOT/data/runs/ddg_${TAG}_serp${POOL}_top10/phase2"
-        if [ ! -e "$HTML_DIR/html_cache.tar.gz" ] && [ ! -d "$HTML_DIR/html_cache" ] && [ ! -L "$HTML_DIR/html_cache" ]; then
-          skip "$cell_label: no html_cache (Phase 1 didn't link it)"
-          continue
-        fi
-        RUN_DIR="$GEODML_DATA_ROOT/data/runs/ddg_${TAG}_serp${POOL}_top10_${V}"
-        DONE_MARKER="$RUN_DIR/phase2/.done_rerank_${TAG}_${V}"
-        if [ -f "$DONE_MARKER" ]; then
-          ok "$cell_label: already done"
-          continue
-        fi
-        if [ "$BACKEND_ARG" = "api" ]; then
-          go "$cell_label: rerank via HF Inference (model=$HF_ID)"
-          python -m interpretability.pipeline.rerank \
-            --model "$HF_ID" \
-            --engine ddg --pool "$POOL" --variant "$V" \
-            --backend api --resume \
-            ${MAX_KW:+--max-keywords "$MAX_KW"} \
-            || fail "$cell_label failed (continuing)"
-        else
-          go "$cell_label: rerank via OpenAI-compat (model=$API_ID)"
-          OPENAI_MODEL_OVERRIDE="$API_ID" \
-          python -m interpretability.pipeline.rerank \
-            --model "$HF_ID" \
-            --engine ddg --pool "$POOL" --variant "$V" \
-            --backend openai --resume \
-            ${MAX_KW:+--max-keywords "$MAX_KW"} \
-            || fail "$cell_label failed (continuing)"
-        fi
-      done
-    done
-  done
-else
-  skip "SKIP_RERANK=1 — leaving 8 ddg-passage rerank cells unfilled"
-fi
+# ── Phase 2: rerank — passage cells across both engines × pools × models
+# By default we run all 16 cells (4 engine×pool combos × 2 models × 2 variants)
+# because both the cluster's existing searxng passage runs AND any prior local
+# ddg passage runs were polluted by the MD5/SHA-256 hash bug. Run
+# clean_passage_results.sh first to wipe the polluted state.
+#
+# To skip a specific engine: ENGINES_RERANK="ddg" (only ddg cells)
+: "${ENGINES_RERANK:=searxng ddg}"
+read -r -a ENGINES_RERANK_ARR <<<"$ENGINES_RERANK"
 
-# ── Phase 3: order_probe — same 8 cells × 2 seeds = 16 cells
-if [ -z "${SKIP_ORDER_PROBE:-}" ]; then
-  step "Order probe — 16 missing ddg×passage cells (8 cells × 2 seeds) via API"
+if [ -z "${SKIP_RERANK:-}" ]; then
+  step "Rerank — passage cells via API (engines: ${ENGINES_RERANK})"
   for SPEC in "Llama-3.3-70B-Instruct|$LLAMA_HF_ID|$LLAMA_API_ID" \
               "Qwen2.5-72B-Instruct|$QWEN_HF_ID|$QWEN_API_ID"; do
     IFS='|' read -r TAG HF_ID API_ID <<<"$SPEC"
-    for POOL in 20 50; do
-      for V in biased_passage neutral_passage; do
-        for SEED in 42 123; do
-          cell_label="${TAG}/pool=${POOL}/${V}/seed=${SEED}"
-          HTML_DIR="$GEODML_DATA_ROOT/data/runs/ddg_${TAG}_serp${POOL}_top10/phase2"
+    for ENGINE in "${ENGINES_RERANK_ARR[@]}"; do
+      for POOL in 20 50; do
+        for V in biased_passage neutral_passage; do
+          cell_label="${ENGINE}/${TAG}/pool=${POOL}/${V}"
+          # Verify HTML is reachable for this cell
+          HTML_DIR="$GEODML_DATA_ROOT/data/runs/${ENGINE}_${TAG}_serp${POOL}_top10/phase2"
           if [ ! -e "$HTML_DIR/html_cache.tar.gz" ] && [ ! -d "$HTML_DIR/html_cache" ] && [ ! -L "$HTML_DIR/html_cache" ]; then
-            skip "$cell_label: no html_cache"
+            skip "$cell_label: no html_cache (Phase 1 didn't link it)"
             continue
           fi
-          OUT="$GEODML_DATA_ROOT/data/order_probe/ddg_${TAG}_serp${POOL}_top10_${V}_seed${SEED}.jsonl"
-          DONE="$GEODML_DATA_ROOT/data/order_probe/.done_ddg_${TAG}_serp${POOL}_top10_${V}_seed${SEED}"
-          if [ -f "$DONE" ] || [ -s "$OUT" ]; then
+          RUN_DIR="$GEODML_DATA_ROOT/data/runs/${ENGINE}_${TAG}_serp${POOL}_top10_${V}"
+          DONE_MARKER="$RUN_DIR/phase2/.done_rerank_${TAG}_${V}"
+          if [ -f "$DONE_MARKER" ]; then
             ok "$cell_label: already done"
             continue
           fi
           if [ "$BACKEND_ARG" = "api" ]; then
-            go "$cell_label: order_probe via HF Inference"
-            python -m interpretability.pipeline.order_probe \
+            go "$cell_label: rerank via HF Inference (model=$HF_ID)"
+            python -m interpretability.pipeline.rerank \
               --model "$HF_ID" \
-              --engine ddg --pool "$POOL" --variant "$V" --seed "$SEED" \
+              --engine "$ENGINE" --pool "$POOL" --variant "$V" \
               --backend api --resume \
               ${MAX_KW:+--max-keywords "$MAX_KW"} \
               || fail "$cell_label failed (continuing)"
           else
-            go "$cell_label: order_probe via OpenAI-compat"
+            go "$cell_label: rerank via OpenAI-compat (model=$API_ID)"
             OPENAI_MODEL_OVERRIDE="$API_ID" \
-            python -m interpretability.pipeline.order_probe \
+            python -m interpretability.pipeline.rerank \
               --model "$HF_ID" \
-              --engine ddg --pool "$POOL" --variant "$V" --seed "$SEED" \
+              --engine "$ENGINE" --pool "$POOL" --variant "$V" \
               --backend openai --resume \
               ${MAX_KW:+--max-keywords "$MAX_KW"} \
               || fail "$cell_label failed (continuing)"
           fi
+        done
+      done
+    done
+  done
+else
+  skip "SKIP_RERANK=1 — leaving passage rerank cells unfilled"
+fi
+
+# ── Phase 3: order_probe — passage cells × 2 seeds across all engines
+if [ -z "${SKIP_ORDER_PROBE:-}" ]; then
+  step "Order probe — passage cells × 2 seeds via API (engines: ${ENGINES_RERANK})"
+  for SPEC in "Llama-3.3-70B-Instruct|$LLAMA_HF_ID|$LLAMA_API_ID" \
+              "Qwen2.5-72B-Instruct|$QWEN_HF_ID|$QWEN_API_ID"; do
+    IFS='|' read -r TAG HF_ID API_ID <<<"$SPEC"
+    for ENGINE in "${ENGINES_RERANK_ARR[@]}"; do
+      for POOL in 20 50; do
+        for V in biased_passage neutral_passage; do
+          for SEED in 42 123; do
+            cell_label="${ENGINE}/${TAG}/pool=${POOL}/${V}/seed=${SEED}"
+            HTML_DIR="$GEODML_DATA_ROOT/data/runs/${ENGINE}_${TAG}_serp${POOL}_top10/phase2"
+            if [ ! -e "$HTML_DIR/html_cache.tar.gz" ] && [ ! -d "$HTML_DIR/html_cache" ] && [ ! -L "$HTML_DIR/html_cache" ]; then
+              skip "$cell_label: no html_cache"
+              continue
+            fi
+            OUT="$GEODML_DATA_ROOT/data/order_probe/${ENGINE}_${TAG}_serp${POOL}_top10_${V}_seed${SEED}.jsonl"
+            DONE="$GEODML_DATA_ROOT/data/order_probe/.done_${ENGINE}_${TAG}_serp${POOL}_top10_${V}_seed${SEED}"
+            if [ -f "$DONE" ] || [ -s "$OUT" ]; then
+              ok "$cell_label: already done"
+              continue
+            fi
+            if [ "$BACKEND_ARG" = "api" ]; then
+              go "$cell_label: order_probe via HF Inference"
+              python -m interpretability.pipeline.order_probe \
+                --model "$HF_ID" \
+                --engine "$ENGINE" --pool "$POOL" --variant "$V" --seed "$SEED" \
+                --backend api --resume \
+                ${MAX_KW:+--max-keywords "$MAX_KW"} \
+                || fail "$cell_label failed (continuing)"
+            else
+              go "$cell_label: order_probe via OpenAI-compat"
+              OPENAI_MODEL_OVERRIDE="$API_ID" \
+              python -m interpretability.pipeline.order_probe \
+                --model "$HF_ID" \
+                --engine "$ENGINE" --pool "$POOL" --variant "$V" --seed "$SEED" \
+                --backend openai --resume \
+                ${MAX_KW:+--max-keywords "$MAX_KW"} \
+                || fail "$cell_label failed (continuing)"
+            fi
+          done
         done
       done
     done

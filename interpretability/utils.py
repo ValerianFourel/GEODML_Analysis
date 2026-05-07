@@ -117,7 +117,9 @@ def load_run_keywords(run_id: str, root: str | Path | None = None) -> Iterable[d
 
 def url_to_html_filename(url: str) -> str:
     """Convention used by the original pipeline: md5(url)[:16] + '.html'."""
-    return hashlib.md5(url.encode("utf-8")).hexdigest()[:16] + ".html"
+    # NB: upstream paperSizeExperiment used SHA-256 for cache filenames
+    # (see GEODML/pipeline/gather_data.py:_url_to_cache_key). Must match.
+    return hashlib.sha256(url.encode()).hexdigest()[:16] + ".html"
 
 
 class HTMLLoader:
