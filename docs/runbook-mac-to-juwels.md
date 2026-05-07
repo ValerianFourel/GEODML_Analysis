@@ -99,78 +99,97 @@ hf api datasets/ValerianFourel/geodml-papersize/tree/main/archives \
 
 Single-file commit → won't trip the 500 you saw earlier.
 
-## Phase 4.5 (optional) — Recover 4 rerank + 8 order-probe cells via API
+## Phase 4.5 (recommended) — Finish Stage A 32/32 via API
 
-Use this if you've lost cluster GPU access and want to fill in everything
-that's API-recoverable before re-getting GPU. Adds Stage A from 24/32 →
-**28/32** and Stage A' from 48/64 → **56/64** (the remaining gaps need ddg
-pool=20 HTML which doesn't exist anywhere — not API-recoverable).
+Use this when you've lost cluster GPU access and want to fill **all 8
+missing rerank cells + 16 order-probe cells**. With `LOCAL_HTML_SOURCE`
+auto-detected, no scraping is needed — the legacy upstream experiment dirs
+on your Mac have ddg HTML for both pool=20 and pool=50.
+
+End state: Stage A **24/32 → 32/32**, Stage A' **48/64 → 64/64**,
+Stage B **2/4 → 4/4** (ddg now joins via the same local caches), C 4/4,
+D 4/4. Only Stage F probing (2/8 → needs GPU) stays unfinished.
 
 ```bash
 # 4.5.1 install the OpenAI client (used by OpenAIRanker)
 pip install openai
 
 # 4.5.2 sign up for an inference provider that hosts both Llama-3.3-70B and
-#       Qwen2.5-72B — recommended:
+#       Qwen2.5-72B. Recommended:
+#         DeepInfra      — cheapest (~$10 total)
 #         Together AI    — has both as -Turbo variants
-#         DeepInfra      — has both
-#         Fireworks AI   — has both
-#       Add a couple of $ in credit; total spend is ~$10–15 for these cells.
+#         Fireworks AI   — fast, similar price
+#       Add ~$15 in credit.
 
-# 4.5.3 set provider env (Together example shown — see script for others)
-export PROVIDER=together
-export OPENAI_API_KEY=tgp_your_together_key_here
+# 4.5.3 set provider env (DeepInfra shown — see the case block in the
+#       script for the other presets)
+export PROVIDER=deepinfra
+export OPENAI_API_KEY=<your_deepinfra_key>
 
-# 4.5.4 pull the legacy ddg pool=50 html_cache too (sync_data.py already did
-#       this if you ran it in Phase 2). If not:
-hf download ValerianFourel/geodml-papersize \
-  data/runs/duckduckgo_Qwen2.5-72B-Instruct_serp50_top10/phase2/html_cache.tar.gz \
-  --repo-type dataset --local-dir geodml_data
+# 4.5.4 confirm LOCAL_HTML_SOURCE will be found (auto-detect handles
+#       ~/Hamburg/GEODML/paperSizeExperiment/output by default)
+ls /Users/valerianfourel/Hamburg/GEODML/paperSizeExperiment/output/duckduckgo_Qwen2.5-72B-Instruct_serp20_top10/html_cache | head
+# expect: 0009ef7ee16573b5.html  ...  (~6,000 files per ddg cache, ~8 GB total
+#                                       across all 4 ddg cells)
 
-# 4.5.5 run it. Idempotent — re-runs skip cells that already finished.
+# 4.5.5 run. Idempotent — re-runs skip already-done cells.
 bash scripts/finish_via_api.sh
 ```
 
-What this does:
+What the script does:
 
-1. **Symlinks** the legacy `duckduckgo_Qwen…` html_cache under each new
-   `ddg_<Model>_serp50_top10/phase2/` path so `_build_passage_map` finds it
-   for both Llama and Qwen cells.
-2. **Reruns rerank** for 4 cells: 2 models × pool=50 × {biased_passage,
-   neutral_passage}. Each cell processes 600 keywords. Pool=50 passage
-   prompts are ~13k input tokens; total ~31M input + ~0.5M output.
-3. **Reruns order-probe** for those same 4 cells × 2 seeds = 8 cells.
-   Same prompt structure, ~62M input + ~1M output total.
-4. **Re-aggregates** the order_probe_summary.parquet so the audit picks up
-   the new cells.
-5. **Then runs Stage B/C/D** via `continue_pipeline.sh`, picking up the new
-   rerank rows automatically through `merge.py`'s variant-suffixed run
-   discovery.
+1. **Phase 1 — Symlink local html_caches.** Walks
+   `$LOCAL_HTML_SOURCE/<engine>_<Model>_serp<N>_top10/html_cache/` for
+   {searxng, duckduckgo} × {Llama, Qwen} × {20, 50} = 8 caches. Renames
+   `duckduckgo` → `ddg` and links each one under
+   `data/runs/<engine>_<Model>_serp<N>_top10/phase2/html_cache`. Both
+   Stage B and rerank's `_build_passage_map` then find them transparently.
 
-Cost (May 2026 ballpark):
+2. **Phase 2 — Rerank.** All 8 missing cells:
+   `ddg × {pool=20, pool=50} × {biased_passage, neutral_passage} ×
+   {Llama, Qwen}`. Each call hits the OpenAI-compatible API with
+   `temperature=0.1, max_tokens=500` (read from `config.py` — matches
+   cluster). Resumable.
 
-| Provider | Llama-3.3-70B $/M in | Qwen2.5-72B $/M in | Total ~ |
-|---|---|---|---|
-| DeepInfra | $0.23 | $0.59 | **~$10** |
-| Together (Turbo) | $0.88 | $1.20 | **~$30** |
-| Fireworks | $0.90 | $0.90 | **~$28** |
+3. **Phase 3 — Order probe.** Same 8 cells × 2 seeds (42, 123) = 16 cells.
+   Re-aggregates `order_probe_summary.parquet` at the end.
 
-Smoke-test with a small cap first so you don't burn $10 on a misconfigured
-key:
+4. **Phase 4 — Stages B/C/D + figures + package.** Delegates to
+   `continue_pipeline.sh`. Stage B now includes ddg cells (since their
+   html_caches are linked). C and D pick up the new rerank rows
+   automatically.
+
+### Cost & wall time
+
+Per pool (covers 4 cells = 2 variants × 2 models, ×2 for order-probe seeds):
+
+| Pool | Keywords | In tokens / call | Total in (rerank + probe) | DeepInfra cost |
+|---|---|---|---|---|
+| 20 | 79 | ~5k | ~5M | ~$2 |
+| 50 | 600 | ~13k | ~94M | ~$25 |
+
+Roughly **$15-30 total on DeepInfra**, ~1-2 hours wall (rate-limit bound).
+
+### Smoke test before paying
 
 ```bash
 MAX_KW=20 bash scripts/finish_via_api.sh
-# verify a few jsonl rows landed under data/runs/ddg_*_serp50_top10_biased_passage/phase2/
-# then rerun without MAX_KW
+# Verify a few jsonl rows landed under
+#   data/runs/ddg_*_serp{20,50}_top10_*_passage/phase2/keywords.jsonl
+# Spot-check the rerank output looks reasonable, then re-run without MAX_KW:
 bash scripts/finish_via_api.sh
 ```
 
-Temperature stays at 0.1 (matches cluster) — `OpenAIRanker.rank` reads
-`C.LLM_TEMPERATURE` directly. Same `max_tokens=500`.
+### Temperature contract
 
-After 4.5 finishes, jump to Phase 4 (zip + upload). The package now contains
-both the new rerank/order-probe cells and Stage B/C/D outputs. Phase 5
-(probing) waits until you have GPU access back.
+Both `OpenAIRanker.rank` and `LocalRanker.rank` read `C.LLM_TEMPERATURE` and
+`C.LLM_MAX_TOKENS` from `interpretability/pipeline/config.py`. The script
+asserts those values are still `0.1` and `500` respectively before doing
+any API calls. If `config.py` has drifted, the script aborts.
+
+After 4.5 finishes, jump to Phase 4 (zip + upload). The package now
+contains both the new rerank/order-probe cells and Stage B/C/D outputs.
+Phase 5 (probing) waits until you have GPU access back.
 
 ## Phase 5 — Finish Stage F on JUWELS (probing, GPU)
 
