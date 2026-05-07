@@ -3,13 +3,25 @@
 #
 # Designed for the case where you've lost cluster GPU access. Uses local
 # html_cache directories from the upstream experiment (LOCAL_HTML_SOURCE)
-# and an OpenAI-compatible inference provider for the LLM.
+# and an inference API for the LLM. Two backend options:
+#
+#   BACKEND=hf       (default; cheapest path)
+#                    HuggingFace InferenceClient. Reads HF_TOKEN. Routes
+#                    automatically to whichever provider hosts the model
+#                    cheapest right now (Together, DeepInfra, Sambanova,
+#                    Fireworks, …). One token, no new account, free tier
+#                    fits a smoke test, pay-as-you-go scales.
+#
+#   BACKEND=openai   OpenAI-compatible endpoint at OPENAI_BASE_URL
+#                    (DeepInfra / Together / Fireworks direct). Use this
+#                    if HF route refuses to host the model or you want a
+#                    specific provider's pricing.
 #
 # What this fills:
 #   - 8 rerank cells: ddg × {pool=20, pool=50} × {biased_passage,
 #     neutral_passage} × {Llama, Qwen} — Stage A 24/32 → 32/32
 #   - 16 order-probe cells: same 8 × 2 seeds — Stage A' 48/64 → 64/64
-#   - Stage B (features) for searxng — variant-agnostic, deterministic
+#   - Stage B (features) for all engines — variant-agnostic, deterministic
 #   - Stage C (merge) for all 4 variants
 #   - Stage D (DML) for all 4 variants
 #   - Paper figures
@@ -20,11 +32,14 @@
 #
 # Required env:
 #   GEODML_DATA_ROOT  abs path to the (unzipped) data dir
-#   OPENAI_API_KEY    DeepInfra/Together/Fireworks key
-#   OPENAI_BASE_URL   provider base URL (or set PROVIDER=...)
+#   plus one of:
+#     HF_TOKEN          if BACKEND=hf (default) — your HF read token works
+#     OPENAI_API_KEY    if BACKEND=openai
+#     OPENAI_BASE_URL   if BACKEND=openai (or use PROVIDER=...)
 #
 # Optional env:
-#   PROVIDER            "deepinfra" / "together" / "fireworks" presets
+#   BACKEND             "hf" (default) / "openai"
+#   PROVIDER            "deepinfra" / "together" / "fireworks" presets for openai
 #   LOCAL_HTML_SOURCE   path holding the legacy {searxng,duckduckgo}_<Model>
 #                       _serp<N>_top10/html_cache/ directories. Default
 #                       auto-detect via known paths.
@@ -86,19 +101,45 @@ if [ -z "${LOCAL_HTML_SOURCE:-}" ]; then
   done
 fi
 
-# ── Sanity: env + deps ───────────────────────────────────────────────────────
-if [ -z "${SKIP_RERANK:-}" ] || [ -z "${SKIP_ORDER_PROBE:-}" ]; then
-  [ -n "${OPENAI_API_KEY:-}" ] || { fail "OPENAI_API_KEY not set"; exit 2; }
-  [ -n "${OPENAI_BASE_URL:-}" ] || { fail "OPENAI_BASE_URL not set (or PROVIDER=...)"; exit 2; }
-  export OPENAI_API_KEY OPENAI_BASE_URL
-fi
+# ── Backend selection ────────────────────────────────────────────────────────
+: "${BACKEND:=hf}"
+case "$BACKEND" in
+  hf|api)
+    BACKEND_ARG="api"
+    if [ -z "${SKIP_RERANK:-}" ] || [ -z "${SKIP_ORDER_PROBE:-}" ]; then
+      [ -n "${HF_TOKEN:-}" ] || {
+        fail "BACKEND=hf requires HF_TOKEN (or use BACKEND=openai). Set HF_TOKEN=hf_..."
+        exit 2
+      }
+      export HF_TOKEN
+    fi
+    ;;
+  openai)
+    BACKEND_ARG="openai"
+    if [ -z "${SKIP_RERANK:-}" ] || [ -z "${SKIP_ORDER_PROBE:-}" ]; then
+      [ -n "${OPENAI_API_KEY:-}" ] || { fail "OPENAI_API_KEY not set"; exit 2; }
+      [ -n "${OPENAI_BASE_URL:-}" ] || { fail "OPENAI_BASE_URL not set (or PROVIDER=...)"; exit 2; }
+      export OPENAI_API_KEY OPENAI_BASE_URL
+    fi
+    ;;
+  *)
+    fail "BACKEND must be 'hf' (HF Inference) or 'openai' (OpenAI-compat). Got '$BACKEND'."
+    exit 2
+    ;;
+esac
 
 step "Pre-flight"
 echo "  GEODML_DATA_ROOT   = $GEODML_DATA_ROOT"
 echo "  LOCAL_HTML_SOURCE  = ${LOCAL_HTML_SOURCE:-(none — only HF tarballs will be used)}"
-echo "  OPENAI_BASE_URL    = ${OPENAI_BASE_URL:-(unset)}"
-echo "  Llama API id       = $LLAMA_API_ID"
-echo "  Qwen  API id       = $QWEN_API_ID"
+echo "  BACKEND            = $BACKEND  (rerank/order_probe --backend=$BACKEND_ARG)"
+if [ "$BACKEND_ARG" = "api" ]; then
+  echo "  HF_TOKEN           = ${HF_TOKEN:0:8}…   (routed via huggingface_hub.InferenceClient)"
+  echo "  Models (HF ids)    = $LLAMA_HF_ID, $QWEN_HF_ID"
+else
+  echo "  OPENAI_BASE_URL    = ${OPENAI_BASE_URL:-(unset)}"
+  echo "  Llama API id       = $LLAMA_API_ID"
+  echo "  Qwen  API id       = $QWEN_API_ID"
+fi
 
 python -c "
 from interpretability.pipeline import config as C
@@ -107,10 +148,12 @@ assert C.LLM_MAX_TOKENS == 500, C.LLM_MAX_TOKENS
 print(f'  LLM config         = temperature={C.LLM_TEMPERATURE}, max_tokens={C.LLM_MAX_TOKENS} (matches cluster)')
 " || { fail "config.py drifted from cluster"; exit 2; }
 
-python -c "import openai" 2>/dev/null || {
-  fail "openai package not installed; run: pip install openai"
-  exit 2
-}
+if [ "$BACKEND_ARG" = "openai" ]; then
+  python -c "import openai" 2>/dev/null || {
+    fail "openai package not installed; run: pip install openai"
+    exit 2
+  }
+fi
 
 # ── Phase 1: symlink local html_caches into the new pipeline's expected paths
 # The new pipeline expects:  data/runs/<engine>_<Model>_serp<N>_top10/phase2/html_cache
@@ -176,14 +219,24 @@ if [ -z "${SKIP_RERANK:-}" ]; then
           ok "$cell_label: already done"
           continue
         fi
-        go "$cell_label: rerank via API (model=$API_ID)"
-        OPENAI_MODEL_OVERRIDE="$API_ID" \
-        python -m interpretability.pipeline.rerank \
-          --model "$HF_ID" \
-          --engine ddg --pool "$POOL" --variant "$V" \
-          --backend openai --resume \
-          ${MAX_KW:+--max-keywords "$MAX_KW"} \
-          || fail "$cell_label failed (continuing)"
+        if [ "$BACKEND_ARG" = "api" ]; then
+          go "$cell_label: rerank via HF Inference (model=$HF_ID)"
+          python -m interpretability.pipeline.rerank \
+            --model "$HF_ID" \
+            --engine ddg --pool "$POOL" --variant "$V" \
+            --backend api --resume \
+            ${MAX_KW:+--max-keywords "$MAX_KW"} \
+            || fail "$cell_label failed (continuing)"
+        else
+          go "$cell_label: rerank via OpenAI-compat (model=$API_ID)"
+          OPENAI_MODEL_OVERRIDE="$API_ID" \
+          python -m interpretability.pipeline.rerank \
+            --model "$HF_ID" \
+            --engine ddg --pool "$POOL" --variant "$V" \
+            --backend openai --resume \
+            ${MAX_KW:+--max-keywords "$MAX_KW"} \
+            || fail "$cell_label failed (continuing)"
+        fi
       done
     done
   done
@@ -212,14 +265,24 @@ if [ -z "${SKIP_ORDER_PROBE:-}" ]; then
             ok "$cell_label: already done"
             continue
           fi
-          go "$cell_label: order_probe via API"
-          OPENAI_MODEL_OVERRIDE="$API_ID" \
-          python -m interpretability.pipeline.order_probe \
-            --model "$HF_ID" \
-            --engine ddg --pool "$POOL" --variant "$V" --seed "$SEED" \
-            --backend openai --resume \
-            ${MAX_KW:+--max-keywords "$MAX_KW"} \
-            || fail "$cell_label failed (continuing)"
+          if [ "$BACKEND_ARG" = "api" ]; then
+            go "$cell_label: order_probe via HF Inference"
+            python -m interpretability.pipeline.order_probe \
+              --model "$HF_ID" \
+              --engine ddg --pool "$POOL" --variant "$V" --seed "$SEED" \
+              --backend api --resume \
+              ${MAX_KW:+--max-keywords "$MAX_KW"} \
+              || fail "$cell_label failed (continuing)"
+          else
+            go "$cell_label: order_probe via OpenAI-compat"
+            OPENAI_MODEL_OVERRIDE="$API_ID" \
+            python -m interpretability.pipeline.order_probe \
+              --model "$HF_ID" \
+              --engine ddg --pool "$POOL" --variant "$V" --seed "$SEED" \
+              --backend openai --resume \
+              ${MAX_KW:+--max-keywords "$MAX_KW"} \
+              || fail "$cell_label failed (continuing)"
+          fi
         done
       done
     done
