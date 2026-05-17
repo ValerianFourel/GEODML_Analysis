@@ -18,11 +18,17 @@
 #   HF_TOKEN          — already used by the python scripts
 #
 # Usage:
-#   ./scripts/slurm/dispatch_all.sh                # full real run
+#   ./scripts/slurm/dispatch_all.sh                # full real run (bf16 by default)
 #   ./scripts/slurm/dispatch_all.sh --dry-run      # print sbatch commands only
 #   ./scripts/slurm/dispatch_all.sh --smoke        # develbooster, small N
 #   ./scripts/slurm/dispatch_all.sh --only ablation
 #   ./scripts/slurm/dispatch_all.sh --models meta-llama/Llama-3.3-70B-Instruct
+#   ./scripts/slurm/dispatch_all.sh --precision 4bit   # legacy nf4 LocalRanker
+#
+# Precision: rerank + order_probe default to LOCAL_PRECISION=full (bf16),
+# matching the HF Inference endpoint so snippet↔RAG comparisons aren't
+# confounded with quantization. Pass --precision 4bit to revert to the older
+# memory-frugal nf4 path.
 #
 # After all chains complete, run scripts/slurm/merge_ablation.sh to consolidate
 # the per-treatment ablation CSVs into the canonical
@@ -51,7 +57,7 @@ FRAMES=(full robust_winners)
 ENGINES=(searxng ddg)
 POOLS=(20 50)
 SEEDS=(42 123)
-ORDER_PROBE_VARIANTS=(biased neutral biased_passage neutral_passage)
+ORDER_PROBE_VARIANTS=(biased neutral biased_rag neutral_rag)
 
 DRY_RUN=0
 SMOKE=0
@@ -62,6 +68,7 @@ TIME_OVERRIDE=""
 SAMPLE_N=""
 PROMPT_VARIANT="${PROMPT_VARIANT:-biased}"
 MAX_ATTEMPTS="${MAX_ATTEMPTS:-6}"
+LOCAL_PRECISION="${LOCAL_PRECISION:-full}"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -83,6 +90,7 @@ while [ $# -gt 0 ]; do
     --pools)   IFS=',' read -r -a POOLS   <<< "$2"; shift 2 ;;
     --seeds)   IFS=',' read -r -a SEEDS   <<< "$2"; shift 2 ;;
     --order-probe-variants) IFS=',' read -r -a ORDER_PROBE_VARIANTS <<< "$2"; shift 2 ;;
+    --precision) LOCAL_PRECISION="$2"; shift 2 ;;
     --help|-h)
       sed -n '2,30p' "$0"
       exit 0 ;;
@@ -104,7 +112,7 @@ emit() {
   local jobname="$1"; shift
   # remaining args are key=value exports
 
-  local exports="ATTEMPT=1,MAX_ATTEMPTS=$MAX_ATTEMPTS"
+  local exports="ATTEMPT=1,MAX_ATTEMPTS=$MAX_ATTEMPTS,LOCAL_PRECISION=$LOCAL_PRECISION"
   [ -n "${JUWELS_PROJECT:-}" ] && exports="$exports,JUWELS_PROJECT=$JUWELS_PROJECT"
   [ -n "$SAMPLE_N" ]            && exports="$exports,SAMPLE_N=$SAMPLE_N"
   for kv in "$@"; do exports="$exports,$kv"; done

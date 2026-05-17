@@ -43,7 +43,7 @@ EXPECTED_COUNTS = {
 
 _RUN_ID_RE = re.compile(
     r"^(?P<engine>duckduckgo|searxng|ddg)_(?P<model>.+?)_serp(?P<pool>\d+)_top\d+"
-    r"(?:_(?:biased|neutral|biased_passage|neutral_passage))?$"
+    r"(?:_(?:biased_passage|neutral_passage|biased_rag|neutral_rag|biased|neutral))?$"
 )
 
 

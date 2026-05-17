@@ -46,6 +46,7 @@ import traceback
 from pathlib import Path
 from typing import Iterable
 
+import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
@@ -137,6 +138,29 @@ def compute_rank_changes(
 
 # ─── core rerank ──────────────────────────────────────────────────────────────
 
+def precision_label(backend: str, precision: str | None) -> str:
+    """Canonical label for the LLM execution regime that produced a record.
+
+    Used as the ``llm_parameters.precision`` field in JSONL output and the
+    ``llm_precision`` column in the Stage C parquet. Five values:
+
+      * ``"bf16-full"``  — backend=local, full-precision bf16 weights.
+      * ``"4bit-nf4"``   — backend=local, nf4 4-bit quantization via bnb.
+      * ``"api-hf"``     — backend=api, HF Inference endpoint (router picks
+                            provider; full precision per HF docs).
+      * ``"api-openai"`` — backend=openai, OpenAI-compatible provider
+                            (DeepInfra / Together / Fireworks; full precision).
+      * ``"unknown"``    — fallback when backfill could not infer.
+    """
+    if backend == "local":
+        return "4bit-nf4" if precision == "4bit" else "bf16-full"
+    if backend == "api":
+        return "api-hf"
+    if backend == "openai":
+        return "api-openai"
+    return "unknown"
+
+
 def rank_one_keyword(
     keyword: str,
     search_results: list[dict],
@@ -145,12 +169,18 @@ def rank_one_keyword(
     model_id: str,
     top_n: int,
     variant: PromptVariant,
+    backend: str = "local",
+    precision: str | None = None,
 ) -> dict:
     """Re-rank one keyword's SERP candidates and return the full record.
 
     Equivalent envelope to ``gather_data.rank_domains_with_llm`` plus
-    ``compute_rank_changes`` and prompt-variant metadata.
+    ``compute_rank_changes`` and prompt-variant metadata. The
+    ``llm_parameters`` dict now also carries the backend + precision label
+    so downstream consumers (and the HF dataset) can stratify on the LLM
+    execution regime.
     """
+    prec_label = precision_label(backend, precision)
     record = {
         "keyword": keyword,
         "llm_role": "re-ranker (LLM re-orders results by relevance)",
@@ -158,6 +188,8 @@ def rank_one_keyword(
         "llm_parameters": {
             "max_tokens": C.LLM_MAX_TOKENS,
             "temperature": C.LLM_TEMPERATURE,
+            "backend": backend,
+            "precision": prec_label,
         },
         "prompt": None,
         "raw_llm_response": None,
@@ -217,23 +249,33 @@ def rank_one_keyword(
 def _serp_to_results(
     rows: pd.DataFrame,
     passage_map: dict[str, str] | None = None,
+    *,
+    keyword: str | None = None,
+    retrieved_map: dict[tuple[str, str], str] | None = None,
 ) -> list[dict]:
     """phase0 parquet rows -> the dict shape gather_data used.
 
-    When ``passage_map`` is given, each result also carries a ``passage`` field
-    looked up by URL — that's what the passage-augmented prompt variants
-    interpolate into the per-result block.
+    Sources of the per-result ``passage`` field:
+      * ``retrieved_map`` (RAG): keyed by (keyword, url) — content is the top-K
+        retrieved chunks joined with " --- ". Used by ``_rag`` variants.
+      * ``passage_map`` (leading-body): keyed by url. Used by ``_passage`` variants.
+      * Otherwise no ``passage`` field is set (snippet-only ``biased``/``neutral``).
     """
     out: list[dict] = []
     for _, r in rows.iterrows():
         url = str(r.get("url", "") or "")
+        pos = r.get("position")
+        if pos is None or (isinstance(pos, float) and pd.isna(pos)):
+            continue
         item: dict = {
-            "position": int(r["position"]),
+            "position": int(pos),
             "title":    str(r.get("title", "") or ""),
             "url":      url,
             "snippet":  str(r.get("snippet", "") or ""),
         }
-        if passage_map is not None:
+        if retrieved_map is not None and keyword is not None:
+            item["passage"] = retrieved_map.get((keyword, url), "")
+        elif passage_map is not None:
             item["passage"] = passage_map.get(url, "")
         out.append(item)
     return out
@@ -335,6 +377,115 @@ def _build_passage_map(
     return {u: out.get(u, "") for u in urls}
 
 
+def _build_retrieved_map(
+    serp: pd.DataFrame,
+    root: Path,
+    engine: str,
+    pool: int,
+    *,
+    k: int = 3,
+    chunk_sep: str = " --- ",
+) -> dict[tuple[str, str], str]:
+    """RAG retrieval: top-K chunks per (keyword, url) via cosine similarity.
+
+    Reads the precomputed index at ``data/rag_index/<engine>_top<pool>/``
+    (built by ``interpretability.pipeline.build_rag_index``). Caches the
+    retrieval result to ``retrieved_top<K>.parquet`` for resumability.
+    """
+    idx_dir = root / "data" / "rag_index" / f"{engine}_top{pool}"
+    if not idx_dir.exists():
+        raise FileNotFoundError(
+            f"RAG index missing at {idx_dir}. "
+            f"Run: python -m interpretability.pipeline.build_rag_index "
+            f"--engine {engine} --pool {pool} --resume"
+        )
+    cache_path = idx_dir / f"retrieved_top{k}.parquet"
+
+    cached: dict[tuple[str, str], str] = {}
+    if cache_path.exists():
+        df_c = pd.read_parquet(cache_path)
+        cached = {
+            (str(row.keyword), str(row.url)): str(row.passage)
+            for row in df_c.itertuples(index=False)
+        }
+        print(
+            f"[rerank-rag] loaded {len(cached):,} cached (kw,url) retrievals "
+            f"from {cache_path.name}",
+            flush=True,
+        )
+
+    chunks_df = pd.read_parquet(idx_dir / "chunks.parquet")
+    keywords_df = pd.read_parquet(idx_dir / "keywords.parquet")
+    chunk_emb = np.load(idx_dir / "chunk_embeddings.npy")
+    kw_emb = np.load(idx_dir / "keyword_embeddings.npy")
+    if chunk_emb.shape[0] != len(chunks_df):
+        raise RuntimeError(
+            f"chunk_embeddings rows ({chunk_emb.shape[0]}) != chunks.parquet rows "
+            f"({len(chunks_df)}); rebuild index"
+        )
+    if kw_emb.shape[0] != len(keywords_df):
+        raise RuntimeError(
+            f"keyword_embeddings rows ({kw_emb.shape[0]}) != keywords.parquet rows "
+            f"({len(keywords_df)}); rebuild index"
+        )
+
+    kw_to_idx: dict[str, int] = {
+        str(k_): i for i, k_ in enumerate(keywords_df["keyword"].tolist())
+    }
+    url_to_chunk_idx: dict[str, np.ndarray] = (
+        chunks_df.reset_index()
+                 .groupby("url")["index"]
+                 .apply(lambda s: s.to_numpy(dtype=np.int64))
+                 .to_dict()
+    )
+    chunk_texts = chunks_df["text"].astype(str).to_numpy()
+
+    pairs: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for r in serp[["keyword", "url"]].itertuples(index=False):
+        key = (str(r.keyword), str(r.url))
+        if key in seen or not r.url or not r.keyword:
+            continue
+        seen.add(key)
+        if key in cached:
+            continue
+        pairs.append(key)
+
+    out: dict[tuple[str, str], str] = dict(cached)
+
+    if not pairs:
+        print(f"[rerank-rag] all {len(seen):,} (kw,url) pairs already cached", flush=True)
+        return out
+
+    print(
+        f"[rerank-rag] computing top-{k} for {len(pairs):,} new (kw,url) pairs "
+        f"(corpus: {len(chunks_df):,} chunks across {len(url_to_chunk_idx):,} urls)",
+        flush=True,
+    )
+    for kw, url in tqdm(pairs, desc="rag retrieve"):
+        if kw not in kw_to_idx or url not in url_to_chunk_idx:
+            out[(kw, url)] = ""
+            continue
+        q = kw_emb[kw_to_idx[kw]]
+        rows = url_to_chunk_idx[url]
+        sims = chunk_emb[rows] @ q
+        n_local = len(sims)
+        if n_local <= k:
+            top_local = np.argsort(-sims)
+        else:
+            top_local = np.argpartition(-sims, k - 1)[:k]
+            top_local = top_local[np.argsort(-sims[top_local])]
+        out[(kw, url)] = chunk_sep.join(chunk_texts[rows[i]] for i in top_local)
+
+    df_out = pd.DataFrame(
+        [{"keyword": k_, "url": u_, "passage": p_} for (k_, u_), p_ in out.items()],
+        columns=["keyword", "url", "passage"],
+    )
+    df_out.to_parquet(cache_path, index=False)
+    print(f"[rerank-rag] retrieval cache → {cache_path.name} ({len(df_out):,} rows)", flush=True)
+    return out
+
+
 def _iter_keyword_groups(serp: pd.DataFrame, pool: int) -> Iterable[tuple[str, pd.DataFrame]]:
     """Yield (keyword, top-`pool` rows sorted by position)."""
     for kw, g in serp.groupby("keyword", sort=False):
@@ -381,12 +532,25 @@ def main() -> int:
                     default=os.getenv("RERANK_BACKEND", "local"),
                     help="'local' = LocalRanker on cluster GPU. 'api' = HF Inference API "
                          "(login-node only; needs HF_TOKEN).")
+    ap.add_argument("--precision", choices=("full", "4bit"),
+                    default=os.getenv("LOCAL_PRECISION", "full"),
+                    help="Local-backend precision. 'full' = bf16 (matches API endpoint). "
+                         "'4bit' = nf4 quantization (memory-frugal, ~2x faster, but "
+                         "drifts from API). Ignored for backend=api/openai.")
     ap.add_argument("--variant",
-                    choices=("biased", "neutral", "biased_passage", "neutral_passage"),
+                    choices=(
+                        "biased", "neutral",
+                        "biased_passage", "neutral_passage",
+                        "biased_rag", "neutral_rag",
+                    ),
                     default=os.getenv("PROMPT_VARIANT", "biased"),
                     help="Prompt variant. Defaults to PROMPT_VARIANT env or 'biased'. "
-                         "The *_passage variants render a multi-line per-result block "
-                         "with ~800 chars of cleaned body text from the cached HTML.")
+                         "The *_passage variants render the leading 800 chars of body "
+                         "text per result. The *_rag variants render the top-K=3 "
+                         "retrieved chunks per (keyword, url) — requires a built RAG "
+                         "index (see build_rag_index.py).")
+    ap.add_argument("--top-k-rag", type=int, default=3,
+                    help="Number of retrieved chunks per (keyword, url) for *_rag variants.")
     ap.add_argument("--data-root", default=None,
                     help="Override geodml_data root (defaults to GEODML_DATA_ROOT or ./geodml_data).")
     ap.add_argument("--max-keywords", type=int, default=None,
@@ -448,18 +612,27 @@ def main() -> int:
 
     # Load SERPs + initialize ranker.
     print(f"[rerank] run_id={run_id}", flush=True)
-    print(f"[rerank] backend={args.backend} model={args.model} variant={args.variant}", flush=True)
+    print(
+        f"[rerank] backend={args.backend} model={args.model} "
+        f"variant={args.variant} precision={args.precision}",
+        flush=True,
+    )
 
     serp = load_serp(backend=args.engine, pool=args.pool, root=root)
     print(f"[rerank] cached SERP rows={len(serp):,} keywords={serp.keyword.nunique():,}", flush=True)
 
     passage_map: dict[str, str] | None = None
+    retrieved_map: dict[tuple[str, str], str] | None = None
     if args.variant.endswith("_passage"):
         passage_map = _build_passage_map(
             serp, root, args.engine, args.model, args.pool, args.top_n,
         )
+    elif args.variant.endswith("_rag"):
+        retrieved_map = _build_retrieved_map(
+            serp, root, args.engine, args.pool, k=args.top_k_rag,
+        )
 
-    ranker = make_ranker(args.backend, args.model)
+    ranker = make_ranker(args.backend, args.model, precision=args.precision)
 
     n_done = 0
     n_err  = 0
@@ -472,7 +645,10 @@ def main() -> int:
         if args.max_keywords is not None and n_done >= args.max_keywords:
             break
 
-        results = _serp_to_results(g, passage_map=passage_map)
+        results = _serp_to_results(
+            g, passage_map=passage_map,
+            keyword=kw, retrieved_map=retrieved_map,
+        )
 
         try:
             rec = rank_one_keyword(
@@ -481,6 +657,8 @@ def main() -> int:
                 model_id=args.model,
                 top_n=args.top_n,
                 variant=args.variant,
+                backend=args.backend,
+                precision=args.precision,
             )
         except Exception as e:
             n_err += 1

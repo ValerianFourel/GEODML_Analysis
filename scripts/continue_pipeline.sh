@@ -20,7 +20,7 @@
 # Optional env:
 #   ENGINES            "searxng ddg"               (default)
 #   POOLS              "20 50"                     (default)
-#   VARIANTS           "biased neutral biased_passage neutral_passage"
+#   VARIANTS           "biased neutral biased_passage neutral_passage biased_rag neutral_rag"
 #   FEATURES_DEVICE    "cpu" / "cuda" / "mps"      (default cpu)
 #   FEATURES_MAX_KW    cap keywords per cell for smoke-testing (default off)
 #   SKIP_FIGURES       "1" to skip make_figures
@@ -40,7 +40,7 @@ export GEODML_DATA_ROOT
 
 : "${ENGINES:=searxng ddg}"
 : "${POOLS:=20 50}"
-: "${VARIANTS:=biased neutral biased_passage neutral_passage}"
+: "${VARIANTS:=biased neutral biased_passage neutral_passage biased_rag neutral_rag}"
 : "${FEATURES_DEVICE:=cpu}"
 : "${FEATURES_MAX_KW:=}"
 : "${SKIP_FIGURES:=}"

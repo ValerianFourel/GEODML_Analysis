@@ -201,6 +201,19 @@ def main() -> int:
     )
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument(
+        "--variant",
+        choices=(
+            "biased", "neutral",
+            "biased_passage", "neutral_passage",
+            "biased_rag", "neutral_rag",
+        ),
+        default=os.getenv("PROMPT_VARIANT", "biased"),
+        help="Prompt variant — controls the rerank prompt that the LLM is fed "
+             "(so logit-lens / attention measurements reflect THIS variant's "
+             "decision context, not the default biased one). Defaults to "
+             "PROMPT_VARIANT env or 'biased'.",
+    )
     args = ap.parse_args()
 
     if args.proxy:
@@ -223,7 +236,7 @@ def main() -> int:
         return 2
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"[weights] device={device} model={args.model}")
+    print(f"[weights] device={device} model={args.model} variant={args.variant}")
     if device == "cpu":
         print("[weights] WARNING: CPU will be ~50x slower.")
 
@@ -255,7 +268,9 @@ def main() -> int:
         cand = serp_by_kw.get(kw)
         if not cand:
             continue
-        prompt = build_rerank_prompt(kw, cand[: args.serp_pool], top_n=args.top_n)
+        prompt = build_rerank_prompt(
+            kw, cand[: args.serp_pool], top_n=args.top_n, variant=args.variant,
+        )
         try:
             res = run_one(model, tok, prompt, device, args.max_len, domain_ids)
         except Exception as e:

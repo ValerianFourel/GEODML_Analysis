@@ -36,6 +36,8 @@ VARIANT_AXES = {
     "neutral":          ("neutral", "snippet"),
     "biased_passage":   ("biased",  "passage"),
     "neutral_passage":  ("neutral", "passage"),
+    "biased_rag":       ("biased",  "rag"),
+    "neutral_rag":      ("neutral", "rag"),
 }
 
 

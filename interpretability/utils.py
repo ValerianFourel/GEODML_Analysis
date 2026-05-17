@@ -337,6 +337,11 @@ def multi_gpu_load_kwargs(
         except Exception as e:
             print(f"[load] bitsandbytes unavailable ({e}); falling back to fp16")
             kw["torch_dtype"] = torch.float16
+    else:
+        # Full-precision path: bf16 on H100/A100. Matches HF Inference endpoint
+        # serving precision closely enough that snippet↔RAG comparisons are not
+        # confounded with quantization.
+        kw["torch_dtype"] = torch.bfloat16
     return kw
 
 
@@ -372,11 +377,15 @@ def log_device_map(model, prefix: str = "[load]") -> None:
 class InferenceRanker:
     """Online: thin wrapper over huggingface_hub.InferenceClient.chat_completion."""
 
-    def __init__(self, model: str, token: str | None = None, max_retries: int = 4):
+    def __init__(self, model: str, token: str | None = None, max_retries: int = 4,
+                 timeout: float = 90.0):
         from huggingface_hub import InferenceClient
 
         self.model = model
-        self.client = InferenceClient(token=token or hf_token())
+        # Per-request timeout — prevents the rerank loop from hanging
+        # indefinitely if the inference router wedges on a single prompt
+        # (observed once on Qwen-72B/searxng/serp50/biased_rag at kw#79).
+        self.client = InferenceClient(token=token or hf_token(), timeout=timeout)
         self.max_retries = max_retries
 
     def rank(self, prompt: str, max_tokens: int = 500, temperature: float = 0.1) -> str:
@@ -398,18 +407,25 @@ class InferenceRanker:
 
 
 class LocalRanker:
-    """Offline: load a HF causal-LM locally (4-bit if CUDA is available) and
-    generate the re-ranking output. Use this on air-gapped clusters like Jülich.
+    """Offline: load a HF causal-LM locally and generate the re-ranking output.
+    Use on cluster GPUs (Jülich booster: --gres=gpu:4 H100/A100).
+
+    Default: full-precision bf16, sharded across visible GPUs via
+    device_map="auto". Matches the HF Inference endpoint precision so local
+    runs are scientifically comparable to API runs. Pass quantize=True to
+    fall back to 4-bit nf4 (memory-frugal, ~2x faster, but introduces drift
+    vs the API).
 
     Handles both chat-template-capable models (Llama-3.*-Instruct, Qwen-Instruct)
     and raw-prompt fallback.
     """
 
-    def __init__(self, model: str, quantize: bool = True, dtype: str = "bfloat16"):
+    def __init__(self, model: str, quantize: bool = False, dtype: str = "bfloat16"):
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
         self.model_name = model
+        self.quantize = quantize
         self.tok = AutoTokenizer.from_pretrained(model, use_fast=True)
         if self.tok.pad_token_id is None:
             self.tok.pad_token = self.tok.eos_token
@@ -417,6 +433,10 @@ class LocalRanker:
         kw = multi_gpu_load_kwargs(quantize=quantize)
         if not torch.cuda.is_available():
             kw["torch_dtype"] = getattr(torch, dtype, torch.float32)
+        print(
+            f"[LocalRanker] model={model} precision={'4bit-nf4' if quantize else 'bf16-full'}",
+            flush=True,
+        )
         self.model = AutoModelForCausalLM.from_pretrained(model, **kw)
         self.model.eval()
         log_device_map(self.model, prefix="[LocalRanker]")
@@ -521,20 +541,36 @@ class OpenAIRanker:
         )
 
 
-def make_ranker(backend: str, model: str) -> "InferenceRanker | LocalRanker | OpenAIRanker":
+def make_ranker(
+    backend: str,
+    model: str,
+    *,
+    precision: str | None = None,
+) -> "InferenceRanker | LocalRanker | OpenAIRanker":
     """Factory. backend ∈ {'api', 'local', 'openai'}.
 
     'api'    -> HuggingFace serverless (InferenceClient)
     'openai' -> OpenAI-compatible provider (DeepInfra/Together/Fireworks/...)
                 via OPENAI_BASE_URL + OPENAI_API_KEY
     'local'  -> load weights locally (CUDA preferred)
+
+    For backend='local', precision ∈ {'full', '4bit'}:
+      - 'full' (default): bf16 weights, matches the HF Inference endpoint.
+      - '4bit': nf4 quantization via bitsandbytes (memory-frugal, drifts from API).
+    Defaults to env LOCAL_PRECISION, else 'full'. Ignored for 'api'/'openai'.
     """
     if backend == "api":
         return InferenceRanker(model=model)
     if backend == "openai":
         return OpenAIRanker(model=model)
     if backend == "local":
-        return LocalRanker(model=model)
+        if precision is None:
+            precision = os.getenv("LOCAL_PRECISION", "full")
+        if precision not in ("full", "4bit"):
+            raise ValueError(
+                f"precision must be 'full' or '4bit', got {precision!r}"
+            )
+        return LocalRanker(model=model, quantize=(precision == "4bit"))
     raise ValueError(f"unknown backend: {backend}")
 
 

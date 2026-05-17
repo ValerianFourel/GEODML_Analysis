@@ -5,11 +5,14 @@
 #
 # Required exports: MODEL, ENGINE, POOL, PROMPT_VARIANT, SEED
 # Optional:         TOP_N (default 10), MAX_KEYWORDS (default unlimited),
-#                   ATTEMPT, MAX_ATTEMPTS
+#                   ATTEMPT, MAX_ATTEMPTS,
+#                   LOCAL_PRECISION (default "full" = bf16; alt "4bit" = nf4)
+#
+# 70B at bf16 ≈ 140 GB; needs all 4 GPUs (already --gres=gpu:4 below).
 #
 # Submit (or use scripts/slurm/dispatch_all.sh --only order_probe):
 #   sbatch --account=$JUWELS_ACCOUNT \
-#     --export=ALL,MODEL=meta-llama/Llama-3.3-70B-Instruct,ENGINE=searxng,POOL=50,PROMPT_VARIANT=neutral,SEED=42 \
+#     --export=ALL,MODEL=meta-llama/Llama-3.3-70B-Instruct,ENGINE=searxng,POOL=50,PROMPT_VARIANT=neutral,SEED=42,LOCAL_PRECISION=full \
 #     scripts/slurm/run_order_probe.sbatch
 
 #SBATCH --partition=booster
@@ -38,9 +41,13 @@ OUTDIR="$GEODML_DATA_ROOT/data/order_probe"
 mkdir -p "$OUTDIR"
 OUT_JSONL="$OUTDIR/${RUN_ID}_seed${SEED}.jsonl"
 
-echo "[order_probe] model=$MODEL engine=$ENGINE pool=$POOL variant=$PROMPT_VARIANT seed=$SEED"
+echo "[order_probe] model=$MODEL engine=$ENGINE pool=$POOL variant=$PROMPT_VARIANT seed=$SEED precision=${LOCAL_PRECISION:-full}"
 echo "[order_probe] run_id=$RUN_ID"
 echo "[order_probe] output=$OUT_JSONL"
+
+# Pre-flight: skip if this seed-cell is already at MAX_KEYWORDS.
+skip_if_at_max "$OUT_JSONL" "${MAX_KEYWORDS:-0}" \
+  "$OUTDIR/.done_${RUN_ID}_seed${SEED}"
 
 set +e
 PROMPT_VARIANT="$PROMPT_VARIANT" python -m interpretability.pipeline.order_probe \
@@ -49,6 +56,7 @@ PROMPT_VARIANT="$PROMPT_VARIANT" python -m interpretability.pipeline.order_probe
   --top-n "$TOP_N" \
   --model "$MODEL" \
   --backend local \
+  --precision "${LOCAL_PRECISION:-full}" \
   --variant "$PROMPT_VARIANT" \
   --seed "$SEED" \
   --resume \
@@ -66,6 +74,7 @@ fi
 chain_resubmit "$0" \
   MODEL="$MODEL" ENGINE="$ENGINE" POOL="$POOL" \
   PROMPT_VARIANT="$PROMPT_VARIANT" SEED="$SEED" TOP_N="$TOP_N" \
+  LOCAL_PRECISION="${LOCAL_PRECISION:-full}" \
   ${MAX_KEYWORDS:+MAX_KEYWORDS="$MAX_KEYWORDS"} \
   || exit "$RC"
 exit 0

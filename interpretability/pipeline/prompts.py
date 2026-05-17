@@ -36,9 +36,17 @@ import os
 import re
 from typing import Literal
 
-PromptVariant = Literal["biased", "neutral", "biased_passage", "neutral_passage"]
+PromptVariant = Literal[
+    "biased", "neutral",
+    "biased_passage", "neutral_passage",
+    "biased_rag", "neutral_rag",
+]
 
-_KNOWN_VARIANTS: tuple[str, ...] = ("biased", "neutral", "biased_passage", "neutral_passage")
+_KNOWN_VARIANTS: tuple[str, ...] = (
+    "biased", "neutral",
+    "biased_passage", "neutral_passage",
+    "biased_rag", "neutral_rag",
+)
 
 # Resolved at import time. Override per-process via PROMPT_VARIANT env var or
 # per-call by passing variant=.
@@ -73,6 +81,8 @@ _HEADERS: dict[str, str] = {
     "neutral":         _NEUTRAL_HEADER,
     "biased_passage":  _BIASED_HEADER,
     "neutral_passage": _NEUTRAL_HEADER,
+    "biased_rag":      _BIASED_HEADER,
+    "neutral_rag":     _NEUTRAL_HEADER,
 }
 
 _FOOTERS: dict[str, str] = {
@@ -80,9 +90,15 @@ _FOOTERS: dict[str, str] = {
     "neutral":         "\nRe-ranked domains:",
     "biased_passage":  "\nRe-ranked product domains:",
     "neutral_passage": "\nRe-ranked domains:",
+    "biased_rag":      "\nRe-ranked product domains:",
+    "neutral_rag":     "\nRe-ranked domains:",
 }
 
+# Per-result body-text cap. _passage uses leading 800 chars from one extraction;
+# _rag joins K=3 retrieved chunks (~800 chars each) so it needs a larger cap to
+# avoid clipping the retrieval signal away.
 _PASSAGE_MAX_CHARS = 800
+_RAG_MAX_CHARS = 2400
 
 
 def _extract_domain(url: str) -> str:
@@ -103,8 +119,23 @@ def active_variant() -> PromptVariant:
 
 
 def is_passage_variant(variant: PromptVariant | None = None) -> bool:
-    """True iff the variant injects per-result body-text passages."""
+    """True iff the variant injects leading-body-text passages (``_passage`` family)."""
     return _resolve(variant).endswith("_passage")
+
+
+def is_rag_variant(variant: PromptVariant | None = None) -> bool:
+    """True iff the variant injects retrieved chunks (``_rag`` family)."""
+    return _resolve(variant).endswith("_rag")
+
+
+def injects_passage_block(variant: PromptVariant | None = None) -> bool:
+    """True iff the prompt renders a multi-line ``passage:`` block per result.
+
+    Both ``_passage`` and ``_rag`` variants render the same per-result shape;
+    only the source of the body text differs (leading 800 chars vs retrieved
+    top-K chunks).
+    """
+    return is_passage_variant(variant) or is_rag_variant(variant)
 
 
 def build_rerank_prompt_with_spans(
@@ -133,7 +164,7 @@ def build_rerank_prompt_with_spans(
     to ``pipeline/gather_data.py:_build_rerank_prompt`` upstream.
     """
     v = _resolve(variant)
-    passage_mode = v.endswith("_passage")
+    passage_mode = injects_passage_block(v)
     header_top = (
         f"Search keyword: {keyword}\n\n"
         + _HEADERS[v].format(top_n=top_n)
@@ -149,7 +180,8 @@ def build_rerank_prompt_with_spans(
         prefix = f"{r['position']}. ["
 
         if passage_mode:
-            passage = (r.get("passage") or "")[:_PASSAGE_MAX_CHARS]
+            cap = _RAG_MAX_CHARS if v.endswith("_rag") else _PASSAGE_MAX_CHARS
+            passage = (r.get("passage") or "")[:cap]
             line = (
                 f"{prefix}{domain}] {r['title']}\n"
                 f"   snippet: {snippet}\n"

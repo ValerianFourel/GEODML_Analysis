@@ -74,20 +74,42 @@ def biased_minus_neutral(cell: pd.DataFrame) -> pd.DataFrame:
     return _pair_delta(cell, "biased", "neutral")
 
 
-def passage_minus_snippet(cell: pd.DataFrame, prompt: str) -> pd.DataFrame:
-    """{prompt}_passage − {prompt} (the per-prompt passage-augmentation effect).
+def augmented_minus_snippet(cell: pd.DataFrame, prompt: str, suffix: str) -> pd.DataFrame:
+    """{prompt}_{suffix} − {prompt}: per-prompt augmentation effect.
 
-    ``prompt`` is "biased" or "neutral". A negative ``delta_oak`` means
-    passages destabilize the rerank; positive means body content makes it
-    more reproducible.
+    ``suffix`` is "passage" (leading body) or "rag" (retrieved chunks).
+    A negative ``delta_oak`` means the augmentation destabilizes the rerank;
+    positive means it makes ranking more reproducible.
     """
-    return _pair_delta(cell, f"{prompt}_passage", prompt)
+    return _pair_delta(cell, f"{prompt}_{suffix}", prompt)
+
+
+def passage_minus_snippet(cell: pd.DataFrame, prompt: str) -> pd.DataFrame:
+    """Back-compat alias: {prompt}_passage − {prompt}."""
+    return augmented_minus_snippet(cell, prompt, "passage")
+
+
+def rag_minus_snippet(cell: pd.DataFrame, prompt: str) -> pd.DataFrame:
+    """{prompt}_rag − {prompt}: per-prompt retrieval-augmentation effect."""
+    return augmented_minus_snippet(cell, prompt, "rag")
 
 
 def biased_minus_neutral_passage(cell: pd.DataFrame) -> pd.DataFrame:
     """biased_passage − neutral_passage (does the prompt-instruction gap survive
     passage augmentation?)."""
     return _pair_delta(cell, "biased_passage", "neutral_passage")
+
+
+def biased_minus_neutral_rag(cell: pd.DataFrame) -> pd.DataFrame:
+    """biased_rag − neutral_rag (does the prompt-instruction gap survive
+    retrieval augmentation?)."""
+    return _pair_delta(cell, "biased_rag", "neutral_rag")
+
+
+def rag_minus_passage(cell: pd.DataFrame, prompt: str) -> pd.DataFrame:
+    """{prompt}_rag − {prompt}_passage: retrieval-relevance effect, holding
+    information amount roughly constant."""
+    return _pair_delta(cell, f"{prompt}_rag", f"{prompt}_passage")
 
 
 def k_trend(df: pd.DataFrame) -> pd.DataFrame:
@@ -141,6 +163,11 @@ def main() -> int:
     delta_biased_passage  = passage_minus_snippet(cell, "biased")
     delta_neutral_passage = passage_minus_snippet(cell, "neutral")
     delta_passage_prompt  = biased_minus_neutral_passage(cell)
+    delta_biased_rag      = rag_minus_snippet(cell, "biased")
+    delta_neutral_rag     = rag_minus_snippet(cell, "neutral")
+    delta_rag_prompt      = biased_minus_neutral_rag(cell)
+    delta_biased_rag_vs_passage  = rag_minus_passage(cell, "biased")
+    delta_neutral_rag_vs_passage = rag_minus_passage(cell, "neutral")
     trend = k_trend(df)
     worst = worst_keywords(df, args.k, args.worst_n)
 
@@ -149,6 +176,11 @@ def main() -> int:
     delta_bp_csv = outdir / "order_probe_biased_passage_minus_biased.csv"
     delta_np_csv = outdir / "order_probe_neutral_passage_minus_neutral.csv"
     delta_pp_csv = outdir / "order_probe_biased_passage_minus_neutral_passage.csv"
+    delta_br_csv = outdir / "order_probe_biased_rag_minus_biased.csv"
+    delta_nr_csv = outdir / "order_probe_neutral_rag_minus_neutral.csv"
+    delta_rr_csv = outdir / "order_probe_biased_rag_minus_neutral_rag.csv"
+    delta_brp_csv = outdir / "order_probe_biased_rag_minus_biased_passage.csv"
+    delta_nrp_csv = outdir / "order_probe_neutral_rag_minus_neutral_passage.csv"
     trend_csv = outdir / "order_probe_k_trend.csv"
     worst_csv = outdir / "order_probe_worst_keywords.csv"
 
@@ -158,6 +190,11 @@ def main() -> int:
         ("biased_passage − biased",                delta_biased_passage,  delta_bp_csv),
         ("neutral_passage − neutral",              delta_neutral_passage, delta_np_csv),
         ("biased_passage − neutral_passage",       delta_passage_prompt,  delta_pp_csv),
+        ("biased_rag − biased",                    delta_biased_rag,      delta_br_csv),
+        ("neutral_rag − neutral",                  delta_neutral_rag,     delta_nr_csv),
+        ("biased_rag − neutral_rag",               delta_rag_prompt,      delta_rr_csv),
+        ("biased_rag − biased_passage",            delta_biased_rag_vs_passage,  delta_brp_csv),
+        ("neutral_rag − neutral_passage",          delta_neutral_rag_vs_passage, delta_nrp_csv),
     )
     for _label, frame, path in extras:
         if not frame.empty:

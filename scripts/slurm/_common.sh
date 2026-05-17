@@ -61,6 +61,30 @@ echo "[common] GEODML_DATA_ROOT=$GEODML_DATA_ROOT"
 echo "[common] visible GPUs:"
 nvidia-smi -L 2>&1 | sed 's/^/[common]   /' || echo "[common] nvidia-smi unavailable"
 
+# Helper: short-circuit if a Stage A / A' output is already at the target
+# keyword count. Avoids paying ~5 min of 70B model-load time on a cell that
+# the dispatcher submitted broadly. Caller passes (jsonl_path, target_count,
+# done_marker_path). On match: touches the done marker and exits 0 cleanly.
+skip_if_at_max() {
+  local jsonl="$1"
+  local target="${2:-0}"
+  local marker="${3:-}"
+  [ -z "$target" ] && return 0
+  [ "$target" -le 0 ] && return 0
+  [ -f "$jsonl" ] || return 0
+  local n
+  n=$(wc -l < "$jsonl" 2>/dev/null | tr -d ' ')
+  n=${n:-0}
+  if [ "$n" -ge "$target" ]; then
+    echo "[skip] $jsonl already has $n ≥ $target keywords; exiting 0 without loading model."
+    if [ -n "$marker" ]; then
+      mkdir -p "$(dirname "$marker")"
+      touch "$marker"
+    fi
+    exit 0
+  fi
+}
+
 # Helper: chain a follow-up job that will pick up via --resume. Pass the path
 # to the current sbatch script as $1 and any extra --export key=value pairs
 # as $2..$N. Caller decides whether to call this (typically only on rc != 0).

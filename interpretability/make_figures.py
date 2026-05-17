@@ -27,7 +27,11 @@ load_dotenv()
 
 
 FRAME_SUFFIX = {"full": "_full", "robust_winners": "_rw"}
-KNOWN_VARIANTS = ("biased", "neutral", "biased_passage", "neutral_passage")
+KNOWN_VARIANTS = (
+    "biased", "neutral",
+    "biased_passage", "neutral_passage",
+    "biased_rag", "neutral_rag",
+)
 
 
 def _resolve_variant_csv(output_dir: Path, stem: str) -> dict[str, Path]:

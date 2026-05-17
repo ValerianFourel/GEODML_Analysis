@@ -161,20 +161,24 @@ def _summarize(df: pd.DataFrame, label: str) -> None:
 
 
 def _enumerate_pair_grid() -> list[tuple[str, str]]:
-    """The four diagnostics: per cell, four pair comparisons."""
+    """Per-cell pair comparisons: snippet vs passage vs rag, biased vs neutral."""
     pairs: list[tuple[str, str]] = []
     for model_id, engine, (serp_n, top_n) in product(
         C.LLM_MODELS, C.ENGINES, C.POOL_SIZES,
     ):
         rid = lambda v: C.run_label_with_variant(engine, model_id, serp_n, top_n, v)
-        # 1) passage effect inside biased
+        # Augmentation effects
         pairs.append((rid("biased"),         rid("biased_passage")))
-        # 2) passage effect inside neutral
         pairs.append((rid("neutral"),        rid("neutral_passage")))
-        # 3) prompt-instruction effect, snippet-only (sanity, should reproduce)
+        pairs.append((rid("biased"),         rid("biased_rag")))
+        pairs.append((rid("neutral"),        rid("neutral_rag")))
+        # Prompt-instruction effects across content modes
         pairs.append((rid("biased"),         rid("neutral")))
-        # 4) prompt-instruction effect, passage-augmented
         pairs.append((rid("biased_passage"), rid("neutral_passage")))
+        pairs.append((rid("biased_rag"),     rid("neutral_rag")))
+        # Information-amount vs query-relevance contrast (rag vs passage)
+        pairs.append((rid("biased_passage"), rid("biased_rag")))
+        pairs.append((rid("neutral_passage"), rid("neutral_rag")))
     return pairs
 
 

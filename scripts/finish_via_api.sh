@@ -198,24 +198,55 @@ else
 fi
 echo "  summary: linked=$linked, already=$already, missing=$missing"
 
-# ── Phase 2: rerank — passage cells across both engines × pools × models
-# By default we run all 16 cells (4 engine×pool combos × 2 models × 2 variants)
-# because both the cluster's existing searxng passage runs AND any prior local
-# ddg passage runs were polluted by the MD5/SHA-256 hash bug. Run
-# clean_passage_results.sh first to wipe the polluted state.
+# ── Phase 2: rerank — augmented cells across both engines × pools × models
+# Augmented variants by default include both _passage (leading 800 chars) and
+# _rag (top-K retrieved chunks). Override via VARIANTS_AUG env var.
 #
-# To skip a specific engine: ENGINES_RERANK="ddg" (only ddg cells)
+# By default we run all 24 cells (4 engine×pool combos × 2 models × 4 variants).
+# To skip a specific engine: ENGINES_RERANK="ddg".
+# To skip RAG variants:    VARIANTS_AUG="biased_passage neutral_passage"
 : "${ENGINES_RERANK:=searxng ddg}"
+: "${VARIANTS_AUG:=biased_passage neutral_passage biased_rag neutral_rag}"
 read -r -a ENGINES_RERANK_ARR <<<"$ENGINES_RERANK"
+read -r -a VARIANTS_AUG_ARR   <<<"$VARIANTS_AUG"
+
+# ── Phase 1.5: build RAG index for any (engine, pool) referenced by a _rag variant
+NEEDS_RAG_INDEX=0
+for V in "${VARIANTS_AUG_ARR[@]}"; do
+  case "$V" in *_rag) NEEDS_RAG_INDEX=1 ;; esac
+done
+if [ "$NEEDS_RAG_INDEX" = "1" ] && [ -z "${SKIP_RERANK:-}" ]; then
+  step "Build RAG index — per (engine, pool) chunks + embeddings"
+  if [ -z "${OPENAI_API_KEY:-}" ]; then
+    fail "OPENAI_API_KEY not set — cannot build RAG embeddings."
+    fail "  Either: export OPENAI_API_KEY=... and re-run; OR"
+    fail "  drop _rag variants: VARIANTS_AUG=\"biased_passage neutral_passage\" bash scripts/finish_via_api.sh"
+    exit 2
+  fi
+  for ENGINE in "${ENGINES_RERANK_ARR[@]}"; do
+    for POOL in 20 50; do
+      META="$GEODML_DATA_ROOT/data/rag_index/${ENGINE}_top${POOL}/meta.json"
+      EMB="$GEODML_DATA_ROOT/data/rag_index/${ENGINE}_top${POOL}/chunk_embeddings.npy"
+      if [ -f "$META" ] && [ -f "$EMB" ] && [ -z "${FORCE_RAG_INDEX:-}" ]; then
+        ok "rag_index ${ENGINE}/pool=${POOL}: already built (set FORCE_RAG_INDEX=1 to rebuild)"
+        continue
+      fi
+      go "rag_index ${ENGINE}/pool=${POOL}: chunking + OpenAI embeddings"
+      python -m interpretability.pipeline.build_rag_index \
+        --engine "$ENGINE" --pool "$POOL" --resume \
+        || fail "rag_index ${ENGINE}/pool=${POOL} failed (continuing)"
+    done
+  done
+fi
 
 if [ -z "${SKIP_RERANK:-}" ]; then
-  step "Rerank — passage cells via API (engines: ${ENGINES_RERANK})"
+  step "Rerank — augmented cells via API (engines: ${ENGINES_RERANK}; variants: ${VARIANTS_AUG})"
   for SPEC in "Llama-3.3-70B-Instruct|$LLAMA_HF_ID|$LLAMA_API_ID" \
               "Qwen2.5-72B-Instruct|$QWEN_HF_ID|$QWEN_API_ID"; do
     IFS='|' read -r TAG HF_ID API_ID <<<"$SPEC"
     for ENGINE in "${ENGINES_RERANK_ARR[@]}"; do
       for POOL in 20 50; do
-        for V in biased_passage neutral_passage; do
+        for V in "${VARIANTS_AUG_ARR[@]}"; do
           cell_label="${ENGINE}/${TAG}/pool=${POOL}/${V}"
           # Verify HTML is reachable for this cell
           HTML_DIR="$GEODML_DATA_ROOT/data/runs/${ENGINE}_${TAG}_serp${POOL}_top10/phase2"
@@ -228,6 +259,15 @@ if [ -z "${SKIP_RERANK:-}" ]; then
           if [ -f "$DONE_MARKER" ]; then
             ok "$cell_label: already done"
             continue
+          fi
+          # Skip cells that already have ≥ MAX_KW keywords on disk.
+          KW_JSONL="$RUN_DIR/phase2/keywords.jsonl"
+          if [ -n "${MAX_KW:-}" ] && [ -f "$KW_JSONL" ]; then
+            n_done=$(wc -l < "$KW_JSONL" | tr -d ' ')
+            if [ "$n_done" -ge "$MAX_KW" ]; then
+              ok "$cell_label: already has $n_done ≥ $MAX_KW keywords (skipping)"
+              continue
+            fi
           fi
           if [ "$BACKEND_ARG" = "api" ]; then
             go "$cell_label: rerank via HF Inference (model=$HF_ID)"
@@ -255,15 +295,15 @@ else
   skip "SKIP_RERANK=1 — leaving passage rerank cells unfilled"
 fi
 
-# ── Phase 3: order_probe — passage cells × 2 seeds across all engines
+# ── Phase 3: order_probe — augmented cells × 2 seeds across all engines
 if [ -z "${SKIP_ORDER_PROBE:-}" ]; then
-  step "Order probe — passage cells × 2 seeds via API (engines: ${ENGINES_RERANK})"
+  step "Order probe — augmented cells × 2 seeds via API (engines: ${ENGINES_RERANK}; variants: ${VARIANTS_AUG})"
   for SPEC in "Llama-3.3-70B-Instruct|$LLAMA_HF_ID|$LLAMA_API_ID" \
               "Qwen2.5-72B-Instruct|$QWEN_HF_ID|$QWEN_API_ID"; do
     IFS='|' read -r TAG HF_ID API_ID <<<"$SPEC"
     for ENGINE in "${ENGINES_RERANK_ARR[@]}"; do
       for POOL in 20 50; do
-        for V in biased_passage neutral_passage; do
+        for V in "${VARIANTS_AUG_ARR[@]}"; do
           for SEED in 42 123; do
             cell_label="${ENGINE}/${TAG}/pool=${POOL}/${V}/seed=${SEED}"
             HTML_DIR="$GEODML_DATA_ROOT/data/runs/${ENGINE}_${TAG}_serp${POOL}_top10/phase2"
@@ -273,9 +313,17 @@ if [ -z "${SKIP_ORDER_PROBE:-}" ]; then
             fi
             OUT="$GEODML_DATA_ROOT/data/order_probe/${ENGINE}_${TAG}_serp${POOL}_top10_${V}_seed${SEED}.jsonl"
             DONE="$GEODML_DATA_ROOT/data/order_probe/.done_${ENGINE}_${TAG}_serp${POOL}_top10_${V}_seed${SEED}"
-            if [ -f "$DONE" ] || [ -s "$OUT" ]; then
+            if [ -f "$DONE" ]; then
               ok "$cell_label: already done"
               continue
+            fi
+            # Skip cells that already have ≥ MAX_KW keywords on disk.
+            if [ -n "${MAX_KW:-}" ] && [ -f "$OUT" ]; then
+              n_done=$(wc -l < "$OUT" | tr -d ' ')
+              if [ "$n_done" -ge "$MAX_KW" ]; then
+                ok "$cell_label: already has $n_done ≥ $MAX_KW keywords (skipping)"
+                continue
+              fi
             fi
             if [ "$BACKEND_ARG" = "api" ]; then
               go "$cell_label: order_probe via HF Inference"

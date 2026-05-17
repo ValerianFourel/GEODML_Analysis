@@ -36,7 +36,7 @@ from interpretability.utils import data_root
 
 _RUN_RE = re.compile(
     r"^(?P<engine>[^_]+)_(?P<model>.+)_serp(?P<pool>\d+)_top(?P<topn>\d+)"
-    r"_(?P<variant>biased_passage|neutral_passage|biased|neutral)$"
+    r"_(?P<variant>biased_passage|neutral_passage|biased_rag|neutral_rag|biased|neutral)$"
 )
 
 
@@ -103,6 +103,9 @@ def merge_one_run(run_id: str, root: Path) -> pd.DataFrame:
             rec = json.loads(line)
             kw = rec.get("keyword") or rec.get("query") or ""
             ranked = {r["domain"]: r["url"] for r in rec.get("ranked_results", [])}
+            llm_params = rec.get("llm_parameters") or {}
+            llm_backend = llm_params.get("backend")
+            llm_precision = llm_params.get("precision")
             for rc in rec.get("rank_changes", []):
                 domain = rc["domain"]
                 url = ranked.get(domain, "")
@@ -118,6 +121,8 @@ def merge_one_run(run_id: str, root: Path) -> pd.DataFrame:
                     "run_id":         run_id,
                     "search_engine":  meta["engine"],
                     "llm_model":      meta["model"],
+                    "llm_backend":    llm_backend,
+                    "llm_precision":  llm_precision,
                     "pool":           meta["pool"],
                     "top_n":          meta["top_n"],
                     "prompt_variant": meta["variant"],
@@ -166,7 +171,11 @@ def main() -> int:
         description="Stage C: merge rerank + features into full_experiment_data_{variant}.parquet",
     )
     ap.add_argument("--variant", required=True,
-                    choices=("biased", "neutral", "biased_passage", "neutral_passage"))
+                    choices=(
+                        "biased", "neutral",
+                        "biased_passage", "neutral_passage",
+                        "biased_rag", "neutral_rag",
+                    ))
     ap.add_argument("--runs", nargs="*", default=None,
                     help="Subset of run_ids to include. Default: all "
                          "{engine}_{model}_serp{pool}_top{top_n}_{variant} "
@@ -219,6 +228,11 @@ def main() -> int:
     print(f"[merge] keywords={df['keyword'].nunique():,} "
           f"runs={df['run_id'].nunique()} "
           f"models={df['llm_model'].nunique()}", flush=True)
+    if "llm_precision" in df.columns:
+        precision_breakdown = (
+            df["llm_precision"].fillna("(missing)").value_counts().to_dict()
+        )
+        print(f"[merge] llm_precision breakdown: {precision_breakdown}", flush=True)
     if "rank_delta" in df.columns:
         n_rd = df["rank_delta"].notna().sum()
         print(f"[merge] rank_delta non-null: {n_rd:,}/{len(df):,} ({n_rd/len(df)*100:.1f}%)",

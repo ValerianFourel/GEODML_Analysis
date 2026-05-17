@@ -934,12 +934,14 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                   formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--variant",
-                    choices=("biased", "neutral", "biased_passage", "neutral_passage",
+                    choices=("biased", "neutral",
+                             "biased_passage", "neutral_passage",
+                             "biased_rag", "neutral_rag",
                              "both", "all"),
                     default="all",
                     help="Which prompt variant to audit. 'both' = biased+neutral "
-                         "(snippet-only); 'all' = the four variants including the "
-                         "passage-augmented arms (default).")
+                         "(snippet-only); 'all' = all six variants (snippet, "
+                         "passage-augmented, RAG-augmented).")
     ap.add_argument("--seeds", nargs="+", type=int, default=[42, 123],
                     help="Order-probe seeds to audit (default: 42 123).")
     ap.add_argument("--data-root", default=None,
@@ -962,7 +964,11 @@ def main() -> int:
 
     data_root = Path(args.data_root) if args.data_root else C.DEFAULT_DATA_ROOT
     if args.variant == "all":
-        variants = ["biased", "neutral", "biased_passage", "neutral_passage"]
+        variants = [
+            "biased", "neutral",
+            "biased_passage", "neutral_passage",
+            "biased_rag", "neutral_rag",
+        ]
     elif args.variant == "both":
         variants = ["biased", "neutral"]
     else:

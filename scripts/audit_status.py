@@ -43,9 +43,14 @@ TREATMENTS = [
     "T1b_stats_density",
 ]
 FRAMES = ["full", "robust_winners"]
-VARIANTS_DEFAULT = ["biased", "neutral", "biased_passage", "neutral_passage"]
+VARIANTS_DEFAULT = [
+    "biased", "neutral",
+    "biased_passage", "neutral_passage",
+    "biased_rag", "neutral_rag",
+]
 SNIPPET_VARIANTS = ["biased", "neutral"]
 PASSAGE_VARIANTS = ["biased_passage", "neutral_passage"]
+RAG_VARIANTS = ["biased_rag", "neutral_rag"]
 
 PLOTS = [
     "figure_a_ablation_full.png",
@@ -360,8 +365,10 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--variant",
-                    choices=("biased", "neutral", "biased_passage",
-                             "neutral_passage", "snippet", "passage", "all"),
+                    choices=("biased", "neutral",
+                             "biased_passage", "neutral_passage",
+                             "biased_rag", "neutral_rag",
+                             "snippet", "passage", "rag", "all"),
                     default="all",
                     help="Which prompt variant(s) to audit. 'snippet'=biased+neutral, "
                          "'passage'=biased_passage+neutral_passage, 'all'=all 4 (default).")
@@ -377,6 +384,8 @@ def main() -> int:
         variants = SNIPPET_VARIANTS
     elif args.variant == "passage":
         variants = PASSAGE_VARIANTS
+    elif args.variant == "rag":
+        variants = RAG_VARIANTS
     else:
         variants = [args.variant]
 

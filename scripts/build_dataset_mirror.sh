@@ -108,12 +108,12 @@ fi
 # ── 1. Skeleton ──────────────────────────────────────────────────────────────
 step "1/6  Create skeleton"
 [ -n "$FORCE" ] && [ -d "$DATASET_ROOT" ] && { go "wiping $DATASET_ROOT"; rm -rf "$DATASET_ROOT"; }
-mkdir -p "$DATASET_ROOT"/{data/{serp,runs,order_probe,features,main,dml_results,dataforseo,logs},interpretability/output,archives}
+mkdir -p "$DATASET_ROOT"/{data/{serp,runs,order_probe,features,main,dml_results,dataforseo,logs,rag_index,passages},interpretability/output,archives}
 ok "skeleton at $DATASET_ROOT"
 
 # ── 2. Cluster data: serp, runs, order_probe, dataforseo, logs ───────────────
 step "2/6  Cluster snapshot → data/"
-for sub in serp dataforseo logs order_probe; do
+for sub in serp dataforseo logs order_probe rag_index passages; do
   src="$GEODML_DATA_ROOT/data/$sub"
   dest="$DATASET_ROOT/data/$sub"
   if [ -d "$src" ]; then
@@ -271,6 +271,23 @@ cd $REPO_ROOT
 python scripts/audit_pipeline.py
 \`\`\`
 
+## Per-row LLM execution metadata
+
+Every record in \`data/main/full_experiment_data_<variant>.parquet\` carries:
+
+- \`llm_backend\`   ∈ {\`local\`, \`api\`, \`openai\`}
+- \`llm_precision\` ∈ {\`bf16-full\`, \`4bit-nf4\`, \`api-hf\`, \`api-openai\`, \`unknown\`}
+
+This lets you stratify analyses by LLM regime. For the 2026-05-17 dataset
+snapshot the breakdown is:
+
+| Variant family | precision |
+|---|---|
+| \`biased\` / \`neutral\` (snippet) | currently \`4bit-nf4\`; will be \`bf16-full\` after the JUWELS bf16 redo lands |
+| \`biased_rag\` / \`neutral_rag\` | \`api-hf\` (HF Inference endpoint, full-precision) |
+
+See PROVENANCE.md for the full mapping.
+
 ## Refresh from sources
 
 \`\`\`bash
@@ -329,6 +346,27 @@ renames on link/copy.
 - Source: \`interpretability/pipeline/config.py\`
 - Both the cluster's \`LocalRanker\` and the local \`OpenAIRanker\` read from
   \`config.py\` directly, so any future re-run is comparable.
+
+## LLM execution-regime columns (new 2026-05-17)
+
+Every per-row record in \`data/main/full_experiment_data_<variant>.parquet\`
+and every JSONL record under \`data/runs/.../keywords.jsonl\` +
+\`data/order_probe/*.jsonl\` carries two new fields:
+
+| Column | Values | Meaning |
+|---|---|---|
+| \`llm_backend\`   | \`local\`, \`api\`, \`openai\` | Which Python class served the inference (LocalRanker, InferenceRanker, OpenAIRanker). |
+| \`llm_precision\` | \`bf16-full\`, \`4bit-nf4\`, \`api-hf\`, \`api-openai\`, \`unknown\` | Normalized regime label — see \`interpretability/pipeline/rerank.py:precision_label\`. |
+
+Historical records that pre-date the precision-tracking change were
+backfilled by \`scripts/backfill_precision.py\` using path-based heuristics
+(snippet variants → \`4bit-nf4\` from cluster, \`_rag\`/\`_passage\` variants →
+\`api-hf\` from \`finish_via_api.sh\`).
+
+Use these columns to stratify when comparing snippet vs RAG arms — the two
+were originally produced under different inference stacks; the 2026-05-17
+reconciliation re-ran the snippet arm in \`bf16-full\` so the cross is
+identifiable.
 
 ## Audit at build time
 

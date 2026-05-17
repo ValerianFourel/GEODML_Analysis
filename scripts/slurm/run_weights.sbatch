@@ -35,6 +35,7 @@ set +e
 python -m interpretability.weight_analysis \
   --model "$MODEL" \
   --sample-n "$SAMPLE_N" \
+  --variant "$PROMPT_VARIANT" \
   --resume \
   --output-dir "$OUTDIR"
 RC=$?

@@ -46,6 +46,7 @@ from tqdm import tqdm
 from interpretability.pipeline import config as C
 from interpretability.pipeline.rerank import (
     _build_passage_map,
+    _build_retrieved_map,
     _iter_keyword_groups,
     _serp_to_results,
     rank_one_keyword,
@@ -118,9 +119,20 @@ def main() -> int:
                     help="HuggingFace model ID for the local 4-bit ranker.")
     ap.add_argument("--backend", choices=("local", "api", "openai"),
                     default=os.getenv("RERANK_BACKEND", "local"))
+    ap.add_argument("--precision", choices=("full", "4bit"),
+                    default=os.getenv("LOCAL_PRECISION", "full"),
+                    help="Local-backend precision. 'full' = bf16 (matches API endpoint). "
+                         "'4bit' = nf4 quantization (legacy default). Ignored for "
+                         "backend=api/openai.")
     ap.add_argument("--variant",
-                    choices=("biased", "neutral", "biased_passage", "neutral_passage"),
+                    choices=(
+                        "biased", "neutral",
+                        "biased_passage", "neutral_passage",
+                        "biased_rag", "neutral_rag",
+                    ),
                     default=os.getenv("PROMPT_VARIANT", "biased"))
+    ap.add_argument("--top-k-rag", type=int, default=3,
+                    help="Number of retrieved chunks per (keyword, url) for *_rag variants.")
     ap.add_argument("--seed", type=int, required=True,
                     help="RNG seed for the per-keyword candidate shuffle.")
     ap.add_argument("--data-root", default=None)
@@ -166,7 +178,8 @@ def main() -> int:
 
     print(f"[order_probe] run_id={run_id} seed={args.seed}", flush=True)
     print(f"[order_probe] backend={args.backend} model={args.model} "
-          f"variant={args.variant} smoke={args.smoke}", flush=True)
+          f"variant={args.variant} precision={args.precision} smoke={args.smoke}",
+          flush=True)
     print(f"[order_probe] output -> {jsonl_path}", flush=True)
 
     # Load SERPs.
@@ -175,13 +188,21 @@ def main() -> int:
           f"keywords={serp.keyword.nunique():,}", flush=True)
 
     passage_map: dict[str, str] | None = None
+    retrieved_map: dict[tuple[str, str], str] | None = None
     if args.variant.endswith("_passage"):
         passage_map = _build_passage_map(
             serp, root, args.engine, args.model, args.pool, args.top_n,
         )
+    elif args.variant.endswith("_rag"):
+        retrieved_map = _build_retrieved_map(
+            serp, root, args.engine, args.pool, k=args.top_k_rag,
+        )
 
     # Ranker (mock under --smoke, real otherwise).
-    ranker = _MockRanker() if args.smoke else make_ranker(args.backend, args.model)
+    ranker = (
+        _MockRanker() if args.smoke
+        else make_ranker(args.backend, args.model, precision=args.precision)
+    )
 
     jsonl_f = jsonl_path.open("a", buffering=1)
     n_done = 0
@@ -196,7 +217,10 @@ def main() -> int:
         if args.max_keywords is not None and n_done >= args.max_keywords:
             break
 
-        results = _serp_to_results(g, passage_map=passage_map)
+        results = _serp_to_results(
+            g, passage_map=passage_map,
+            keyword=kw, retrieved_map=retrieved_map,
+        )
         original_order = [int(r["position"]) for r in results]
         shuffled, perm = _shuffle_for_keyword(results, seed=args.seed, keyword=kw)
 
@@ -207,6 +231,8 @@ def main() -> int:
                 model_id=args.model,
                 top_n=args.top_n,
                 variant=args.variant,
+                backend=args.backend,
+                precision=args.precision,
             )
         except Exception as e:
             n_err += 1

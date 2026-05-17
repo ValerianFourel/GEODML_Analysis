@@ -141,8 +141,16 @@ def main() -> int:
                                   formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument(
         "--variants", nargs="+",
-        default=["biased", "neutral", "biased_passage", "neutral_passage"],
-        choices=("biased", "neutral", "biased_passage", "neutral_passage"),
+        default=[
+            "biased", "neutral",
+            "biased_passage", "neutral_passage",
+            "biased_rag", "neutral_rag",
+        ],
+        choices=(
+            "biased", "neutral",
+            "biased_passage", "neutral_passage",
+            "biased_rag", "neutral_rag",
+        ),
     )
     ap.add_argument("--seeds", nargs="+", type=int, default=[42, 123])
     ap.add_argument("--K", nargs="+", type=int, default=[3, 5, 10])

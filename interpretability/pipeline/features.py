@@ -662,7 +662,11 @@ def _pick_html_run_id(root: Path, engine: str, pool: int) -> str | None:
             continue
         # Only un-suffixed (original cached) runs have HTML.
         rid = d.name
-        if rid.endswith(("_biased", "_neutral", "_biased_passage", "_neutral_passage")):
+        if rid.endswith((
+            "_biased", "_neutral",
+            "_biased_passage", "_neutral_passage",
+            "_biased_rag", "_neutral_rag",
+        )):
             continue
         if not rid.startswith(engine + "_"):
             continue
