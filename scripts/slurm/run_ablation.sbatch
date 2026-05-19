@@ -16,7 +16,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=48
 #SBATCH --gres=gpu:4
-#SBATCH --time=23:55:00
+#SBATCH --time=05:55:00
 #SBATCH --job-name=geodml-abl
 #SBATCH --output=logs/%x-%j.out
 #SBATCH --error=logs/%x-%j.err

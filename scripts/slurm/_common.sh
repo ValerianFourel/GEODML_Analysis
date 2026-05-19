@@ -21,9 +21,32 @@ if [ -n "${JUWELS_PROJECT:-}" ]; then
   jutil env activate -p "$JUWELS_PROJECT"
 fi
 
-# Module stack. Stages/2024 is the JSC default at time of writing; bump if the
-# site rolls forward. `module spider <name>` shows availability.
-module load Stages/2024 GCC Python CUDA 2>&1 | sed 's/^/[modules] /' || true
+# JUPITER compute nodes mount /e/ instead of /p/. Translate SLURM_SUBMIT_DIR
+# captured on login under /p/ to the matching /e/ path. Defaults make this
+# safe even if jutil failed to set PROJECT/SCRATCH.
+_PROJ="${PROJECT:-/e/project1/scifi}"
+_SCR="${SCRATCH:-/e/scratch/scifi}"
+if [ ! -d "${SLURM_SUBMIT_DIR:-}" ]; then
+  ALT="${SLURM_SUBMIT_DIR:-}"
+  ALT="${ALT/#\/p\/project1\/scifi/$_PROJ}"
+  ALT="${ALT/#\/p\/scratch\/scifi/$_SCR}"
+  if [ -n "$ALT" ] && [ -d "$ALT" ]; then
+    echo "[common] path-translate /p/ -> $ALT"
+    SLURM_SUBMIT_DIR="$ALT"
+    export SLURM_SUBMIT_DIR
+  fi
+fi
+
+# Module stack. JUPITER has Stages/{2025,2026}; 2026 is the default. JUWELS
+# has Stages/2024. We standardise on 2026 because JUPITER is the active host.
+# IMPORTANT: do NOT pipe `module load` through sed — the leftmost command of a
+# pipeline runs in a subshell, so any LD_LIBRARY_PATH it sets is local to that
+# subshell and python at runtime fails with `libpython3.13.so.1.0: cannot open
+# shared object file` (rc=127). Capture to a tempfile, then pretty-print.
+_modlog=$(mktemp -t modlog.XXXXXX)
+module load Stages/2026 GCC Python CUDA >"$_modlog" 2>&1 || true
+[ -s "$_modlog" ] && sed 's/^/[modules] /' "$_modlog"
+rm -f "$_modlog"
 
 # Activate the project venv created on the login node.
 if [ ! -f "$SLURM_SUBMIT_DIR/.venv/bin/activate" ]; then
